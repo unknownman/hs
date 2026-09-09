@@ -15,11 +15,12 @@
 //! current version and applies only the migrations that have not yet run.
 
 pub mod migrations;
+pub mod repository;
 
 use std::path::Path;
 
 use r2d2_sqlite::SqliteConnectionManager;
-use r2d2_sqlite::rusqlite::Connection;
+use rusqlite::Connection;
 
 use crate::error::HsError;
 
@@ -48,9 +49,17 @@ pub fn init_db(db_path: &Path) -> Result<DbPool, HsError> {
 
     let pool = r2d2::Pool::builder().max_size(4).build(manager)?;
 
-    // Apply migrations using a dedicated connection from the pool.
+    // Apply migrations + set WAL mode ONCE using a dedicated connection.
+    //
+    // WAL mode is persistent at the file level, so it is NOT set in
+    // `customize_connection` (which runs on every new connection).
+    // Setting it repeatedly races with concurrent WAL activation on a
+    // fresh database — one connection may hold the exclusive lock needed
+    // to switch journal modes.  `busy_timeout` makes that transient
+    // condition wait instead of fail.
     {
         let conn = pool.get()?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         migrations::run(&conn)?;
     }
 
@@ -60,26 +69,28 @@ pub fn init_db(db_path: &Path) -> Result<DbPool, HsError> {
 /// Per-connection initialization hook.
 ///
 /// Executed once when a connection is created (or recycled after an
-/// error).  These PRAGMAs are **required** for correct concurrent
-/// behavior.
-fn customize_connection(conn: &mut Connection) -> Result<(), r2d2_sqlite::rusqlite::Error> {
+/// error).  `busy_timeout` gives SQLite a busy handler so transient
+/// write-locks from other connections/shells are waited on rather than
+/// immediately failed.
+fn customize_connection(conn: &mut Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
-        "PRAGMA journal_mode = WAL;
+        "PRAGMA busy_timeout = 5000;
          PRAGMA synchronous  = NORMAL;
          PRAGMA foreign_keys = ON;",
     )?;
     Ok(())
 }
 
+// Public so repository tests can reuse the pool builder.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Build an in-memory pool with all migrations applied.
     ///
     /// Note: in-memory SQLite databases cannot use WAL mode — this is
     /// expected.  The `db_init_with_real_file` test covers WAL.
-    fn test_pool() -> DbPool {
+    pub fn test_pool() -> DbPool {
         let manager = SqliteConnectionManager::memory().with_init(customize_connection);
 
         let pool = r2d2::Pool::builder()
@@ -122,11 +133,18 @@ mod tests {
             rows.filter_map(Result::ok).collect()
         };
 
+        // Tables
+        assert!(objects.contains(&"projects".to_string()));
         assert!(objects.contains(&"commands".to_string()));
         assert!(objects.contains(&"executions".to_string()));
+        assert!(objects.contains(&"command_stats".to_string()));
+        assert!(objects.contains(&"pins".to_string()));
+
+        // Triggers
         assert!(objects.contains(&"commands_ai".to_string()));
         assert!(objects.contains(&"commands_ad".to_string()));
         assert!(objects.contains(&"commands_au".to_string()));
+        assert!(objects.contains(&"stats_on_insert".to_string()));
     }
 
     #[test]
@@ -135,7 +153,7 @@ mod tests {
         let conn = pool.get().expect("failed to get connection");
 
         conn.execute(
-            "INSERT INTO commands (cmd_string, project_hash) VALUES ('ls', NULL)",
+            "INSERT INTO commands (cmd_hash, cmd_string) VALUES ('abc', 'ls')",
             [],
         )
         .expect("failed to insert command");
@@ -154,8 +172,8 @@ mod tests {
         let conn = pool.get().expect("failed to get connection");
 
         conn.execute(
-            "INSERT INTO commands (cmd_string, project_hash) \
-             VALUES ('cargo build --release', NULL)",
+            "INSERT INTO commands (cmd_hash, cmd_string) \
+             VALUES ('def', 'cargo build --release')",
             [],
         )
         .expect("failed to insert");

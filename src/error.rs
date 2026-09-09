@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[derive(Debug, thiserror::Error)]
 pub enum HsError {
     #[error("database error: {0}")]
-    DatabaseError(#[from] r2d2_sqlite::rusqlite::Error),
+    DatabaseError(#[from] rusqlite::Error),
 
     #[error("database migration failed at step {step}: {message}")]
     MigrationError { step: u32, message: String },
