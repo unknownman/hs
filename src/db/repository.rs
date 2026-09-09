@@ -8,13 +8,15 @@
 
 #![allow(dead_code)]
 
+use chrono::{SecondsFormat, Utc};
 use rusqlite::params;
 use rusqlite::types::Value;
 
 use crate::db::DbPool;
 use crate::error::HsError;
-use crate::models::{CommandStats, cmd_hash, dir_hash};
+use crate::models::{CommandStats, ImportEntry, ImportReport, cmd_hash, dir_hash};
 use crate::ranking::{RawCandidate, SearchContext};
+use crate::redaction::sanitize_command;
 
 /// High-level interface over the SQLite persistence layer.
 ///
@@ -76,17 +78,15 @@ impl Store {
         };
 
         // 2. Resolve or create the command.
+        //
+        // NOTE: SQLite UNIQUE indexes treat NULLs as distinct, so
+        // `UNIQUE(cmd_hash, project_id)` does NOT dedup commands recorded
+        // outside any project. We therefore check existence explicitly
+        // (with `project_id IS ?`) before inserting, and reuse the id when
+        // the command is already known. This keeps both capture and bulk
+        // import idempotent for project-less commands.
         let c_hash = cmd_hash(cmd_string);
-        conn.execute(
-            "INSERT OR IGNORE INTO commands (project_id, cmd_hash, cmd_string)
-             VALUES (?1, ?2, ?3)",
-            params![project_id, c_hash, cmd_string],
-        )?;
-        let command_id: i64 = conn.query_row(
-            "SELECT id FROM commands WHERE cmd_hash = ?1 AND project_id IS ?2",
-            params![c_hash, project_id],
-            |row| row.get(0),
-        )?;
+        let command_id = upsert_command(&conn, project_id, &c_hash, cmd_string)?;
 
         // 3. Insert the execution (triggers update command_stats).
         conn.execute(
@@ -96,6 +96,118 @@ impl Store {
         )?;
 
         Ok(())
+    }
+
+    /// Bulk-import legacy shell history (Phase 8).
+    ///
+    /// Runs inside a **single SQLite transaction**: every command and
+    /// execution row is inserted from one `Transaction`, which keeps a
+    /// 20,000-line `.zsh_history` import well under a second instead of
+    /// paying a fsync/commit per line.
+    ///
+    /// Privacy: every command passes through
+    /// [`sanitize_command`](crate::redaction::sanitize_command) **before**
+    /// hashing or persistence, so secrets never touch the database.
+    ///
+    /// Dedup: commands are keyed on `(cmd_hash, NULL project)`. A history
+    /// line whose command already exists (from an earlier import or an
+    /// earlier line in the same file) is counted as a duplicate and
+    /// skipped entirely — making re-imports idempotent.
+    ///
+    /// Legacy history has no exit/duration signals, so neutral defaults
+    /// (`exit_code = 0`, `duration_ms = 0`) are recorded, plus the
+    /// original timestamp when the source format provided one.
+    pub fn import_entries(
+        &self,
+        entries: Vec<ImportEntry>,
+        working_dir: &str,
+    ) -> Result<ImportReport, HsError> {
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction()?;
+
+        // The insert loop lives in its own scope so the prepared statement
+        // (which borrows `tx`) is dropped before `tx.commit()`.
+        let report = {
+            let mut insert_execution = tx.prepare(
+                "INSERT INTO executions (command_id, exit_code, duration_ms, working_dir, executed_at)
+                 VALUES (?1, 0, 0, ?2, ?3)",
+            )?;
+
+            let mut report = ImportReport {
+                imported: 0,
+                duplicates: 0,
+                redacted: 0,
+            };
+
+            for entry in entries {
+                let clean = sanitize_command(&entry.cmd);
+                if clean != entry.cmd {
+                    report.redacted += 1;
+                }
+                if clean.trim().is_empty() {
+                    continue;
+                }
+
+                let hash = cmd_hash(&clean);
+                // Already present (earlier import / earlier line in this
+                // file)? Skip — keeps re-imports idempotent.
+                if command_id_for(&tx, &hash, None)?.is_some() {
+                    report.duplicates += 1;
+                    continue;
+                }
+                let command_id = upsert_command(&tx, None, &hash, &clean)?;
+                let executed_at = entry
+                    .executed_at
+                    .unwrap_or_else(Utc::now)
+                    .to_rfc3339_opts(SecondsFormat::Secs, true);
+                insert_execution.execute(params![command_id, working_dir, executed_at])?;
+                report.imported += 1;
+            }
+
+            report
+        };
+
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// Total number of execution rows (used for the empty-state hint and
+    /// `doctor` volume reporting).
+    pub fn execution_count(&self) -> Result<i64, HsError> {
+        let conn = self.pool.get()?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM executions", [], |row| row.get(0))?;
+        Ok(n)
+    }
+
+    /// Total number of unique stored commands.
+    pub fn command_count(&self) -> Result<i64, HsError> {
+        let conn = self.pool.get()?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))?;
+        Ok(n)
+    }
+
+    /// All stored command strings (test/doctor diagnostics).
+    pub fn command_strings(&self) -> Result<Vec<String>, HsError> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare("SELECT cmd_string FROM commands WHERE project_id IS NULL")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The `executed_at` timestamp text for the first execution of
+    /// `cmd_string`, if any.
+    pub fn executed_at(&self, cmd_string: &str) -> Result<Option<String>, HsError> {
+        let conn = self.pool.get()?;
+        let ts: Option<String> = conn.query_row(
+            "SELECT e.executed_at
+             FROM executions e
+             JOIN commands c ON c.id = e.command_id
+             WHERE c.project_id IS NULL AND c.cmd_string = ?1
+             ORDER BY e.executed_at LIMIT 1",
+            params![cmd_string],
+            |row| row.get(0),
+        )?;
+        Ok(ts)
     }
 
     /// Fetch raw candidates for ranking (Phase 6 recall halving).
@@ -129,8 +241,15 @@ impl Store {
                 INNER JOIN commands_fts ON commands_fts.rowid = c.id
                 LEFT JOIN command_stats s ON s.command_id = c.id",
             );
-            wheres.push("commands_fts MATCH ?".to_string());
-            values.push(Value::Text(sanitize_fts_query(query)));
+            match sanitize_fts_query(query) {
+                Some(q) => {
+                    wheres.push("commands_fts MATCH ?".to_string());
+                    values.push(Value::Text(q));
+                }
+                // No searchable tokens (e.g. a query of `***`): the user
+                // asked for nothing, so nothing can match.
+                None => wheres.push("1 = 0".to_string()),
+            }
         } else {
             sql.push_str(
                 " 1.0 AS bm
@@ -256,17 +375,72 @@ impl Store {
     }
 }
 
+/// Look up the id of an existing command row for `(cmd_hash, project_id)`.
+///
+/// `project_id IS ?` (instead of `= ?`) matches `NULL` project ids too —
+/// important since SQLite UNIQUE indexes treat `NULL`s as distinct, so
+/// existence cannot be inferred from a failed insert.
+fn command_id_for(
+    conn: &rusqlite::Connection,
+    cmd_hash: &str,
+    project_id: Option<i64>,
+) -> Result<Option<i64>, HsError> {
+    use rusqlite::OptionalExtension;
+    let id = conn
+        .query_row(
+            "SELECT id FROM commands WHERE cmd_hash = ?1 AND project_id IS ?2",
+            params![cmd_hash, project_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(id)
+}
+
+/// Return the id of `(cmd_hash, project_id)`, inserting the command row
+/// first if it does not exist. Null-safe (see [`command_id_for`]).
+fn upsert_command(
+    conn: &rusqlite::Connection,
+    project_id: Option<i64>,
+    cmd_hash: &str,
+    cmd_string: &str,
+) -> Result<i64, HsError> {
+    if let Some(id) = command_id_for(conn, cmd_hash, project_id)? {
+        return Ok(id);
+    }
+    conn.execute(
+        "INSERT INTO commands (project_id, cmd_hash, cmd_string)
+         VALUES (?1, ?2, ?3)",
+        params![project_id, cmd_hash, cmd_string],
+    )?;
+    command_id_for(conn, cmd_hash, project_id)?
+        .ok_or_else(|| HsError::from(rusqlite::Error::QueryReturnedNoRows))
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
-/// Quote each whitespace-separated token so FTS5 treats it as a literal
-/// (AND'd) phrase term instead of parsing operators/column filters out of
-/// user input. Embedded double quotes are escaped by doubling (FTS5 rule).
-fn sanitize_fts_query(query: &str) -> String {
-    query
+/// Quote each searchable token so FTS5 treats it as a literal (AND'd)
+/// phrase term instead of parsing operators out of user input.
+///
+/// Phase 8 hardening: instead of quoting raw chunks (which still leaks
+/// FTS5 syntax — asterisks, colons, parens and unbalanced quotes can
+/// produce parser errors or empty phrases), we extract only
+/// tokenizer-producible runs (`[A-Za-z0-9_]`, matching SQLite's unicode61
+/// tokenizer) and quote each one. FTS keywords (`AND`, `OR`, `NOT`) cease
+/// to be operators because quoted terms are literal. Pure-punctuation
+/// input yields `None`, which the caller turns into a no-match filter.
+fn sanitize_fts_query(query: &str) -> Option<String> {
+    let terms: Vec<String> = query
         .split_whitespace()
-        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" ")
+        .flat_map(|chunk| chunk.split(|c: char| !(c.is_alphanumeric() || c == '_')))
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("\"{token}\""))
+        .collect();
+
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" "))
+    }
 }
 
 #[cfg(test)]
@@ -755,6 +929,140 @@ mod tests {
         assert_eq!(
             candidates[0].cmd_string,
             "echo hello-from-hs-project --force"
+        );
+    }
+
+    /// Phase 8 FTS hardening: quotes, asterisks, colons, and the FTS
+    /// keywords `AND`/`OR`/`NOT` must never become operators or errors.
+    #[test]
+    fn sanitize_fts_query_handles_hostile_input() {
+        // Unbalanced quote → the quote char is dropped, words survive.
+        assert_eq!(
+            sanitize_fts_query("redis \"hgetall"),
+            Some("\"redis\" \"hgetall\"".to_string())
+        );
+        // Asterisks/colons are separators, keywords become literal terms.
+        assert_eq!(
+            sanitize_fts_query("docker:* AND OR NOT (build)"),
+            Some("\"docker\" \"AND\" \"OR\" \"NOT\" \"build\"".to_string())
+        );
+        // URL-ish input: scheme + host survive as separate terms.
+        assert_eq!(
+            sanitize_fts_query("curl https://api.example.com/health"),
+            Some("\"curl\" \"https\" \"api\" \"example\" \"com\" \"health\"".to_string())
+        );
+        // Pure punctuation has no searchable tokens.
+        assert_eq!(sanitize_fts_query("*** ::: \" )"), None);
+    }
+
+    /// A punctuation-only query must yield zero rows, not an FTS5 error.
+    #[test]
+    fn punctuation_only_query_returns_nothing() {
+        let store = test_store();
+        store
+            .insert_execution(None, "cargo build", 0, 10, "/tmp")
+            .unwrap();
+
+        let ctx = SearchContext {
+            query: Some("*** :: \"".to_string()),
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window_days: None,
+        };
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        assert!(candidates.is_empty(), "no tokens → no candidates, no crash");
+    }
+
+    /// Phase 8 acceptance: bulk import runs atomically, redacts secrets,
+    /// preserves timestamps, and dedups on re-import.
+    #[test]
+    fn bulk_import_redacts_preserves_timestamps_and_is_idempotent() {
+        use chrono::DateTime as ChDateTime;
+
+        let store = test_store();
+
+        let secret = format!("AKIA{}", "A".repeat(16));
+        let entries = vec![
+            crate::models::ImportEntry {
+                cmd: format!("export AWS_ACCESS_KEY_ID={secret}"),
+                executed_at: ChDateTime::parse_from_rfc3339("2022-01-01T00:00:00Z")
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .ok(),
+            },
+            crate::models::ImportEntry {
+                cmd: "npm install \\\nlodash".to_string(), // multiline zsh entry
+                executed_at: ChDateTime::parse_from_rfc3339("2022-06-15T12:30:00Z")
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .ok(),
+            },
+            crate::models::ImportEntry {
+                cmd: "echo no-timestamp".to_string(),
+                executed_at: None,
+            },
+        ];
+
+        let first = store.import_entries(entries, "/home/user").unwrap();
+        assert_eq!(first.imported, 3);
+        assert_eq!(first.redacted, 1, "the API key command must be counted");
+        assert_eq!(first.duplicates, 0);
+
+        let stored: Vec<(String, String)> = {
+            // max_size(1) pool: hold the connection only inside this
+            // scope so later `Store` calls can also borrow it.
+            let conn = store.pool.get().expect("pool get failed");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT c.cmd_string, e.executed_at
+                     FROM commands c
+                     JOIN executions e ON e.command_id = c.id
+                     WHERE c.project_id IS NULL
+                     ORDER BY e.executed_at",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap();
+            rows.filter_map(Result::ok).collect()
+        };
+
+        assert_eq!(stored.len(), 3);
+        // Timestamps survive the round-trip (RFC3339 text form).
+        assert_eq!(stored[0].1, "2022-01-01T00:00:00Z");
+        assert_eq!(stored[1].1, "2022-06-15T12:30:00Z");
+
+        // The secret must never reach the database.
+        assert!(
+            stored[0].0.contains("[REDACTED]") && !stored[0].0.contains(&secret),
+            "API key must be redacted before persistence"
+        );
+
+        // Multiline command preserved verbatim.
+        assert_eq!(stored[1].0, "npm install \\\nlodash");
+
+        // Re-import of the same lines must not create new rows.
+        let same = vec![
+            crate::models::ImportEntry {
+                cmd: format!("export AWS_ACCESS_KEY_ID={secret}"),
+                executed_at: None,
+            },
+            crate::models::ImportEntry {
+                cmd: "npm install \\\nlodash".to_string(),
+                executed_at: None,
+            },
+            crate::models::ImportEntry {
+                cmd: "echo no-timestamp".to_string(),
+                executed_at: None,
+            },
+        ];
+        let second = store.import_entries(same, "/home/user").unwrap();
+        assert_eq!(second.imported, 0, "no new rows on re-import");
+        assert_eq!(second.duplicates, 3, "all three already existed");
+        assert_eq!(
+            store.execution_count().unwrap(),
+            3,
+            "total executions must be unchanged"
         );
     }
 

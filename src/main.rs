@@ -4,8 +4,10 @@ mod capture;
 mod cli;
 mod context;
 mod db;
+mod doctor;
 mod error;
 mod guard;
+mod import;
 mod models;
 mod ranking;
 mod redaction;
@@ -60,14 +62,11 @@ fn run(cli: Cli) -> Result<i32, HsError> {
             let pool = get_pool()?;
             cmd_pins(&pool);
         }
-        Some(Commands::Import) => {
+        Some(Commands::Import { path }) => {
             let pool = get_pool()?;
-            cmd_import(&pool);
+            return cmd_import(&pool, path);
         }
-        Some(Commands::Doctor) => {
-            let pool = get_pool()?;
-            cmd_doctor(&pool);
-        }
+        Some(Commands::Doctor) => return cmd_doctor(),
 
         // ── Subcommands that do NOT need the database ───────────────
         Some(Commands::Init { shell }) => cmd_init(shell),
@@ -126,7 +125,10 @@ fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
     let ranked = rank_commands(candidates, current_project_id);
 
     if ranked.is_empty() {
-        println!("No matching commands in history.");
+        // Distinguish "fresh install" from "nothing matched": a brand-new
+        // database points the user at capture/import instead of silence.
+        let has_any_history = store.execution_count()? > 0;
+        println!("{}", no_results_message(has_any_history));
         return Ok(0);
     }
 
@@ -208,10 +210,10 @@ fn cmd_pins(pool: &DbPool) {
     println!("Route: Pins");
 }
 
-/// Import standard shell history.
-fn cmd_import(pool: &DbPool) {
-    let _ = pool;
-    println!("Route: Import");
+/// Import standard shell history (auto-detected or explicit path).
+fn cmd_import(pool: &DbPool, path: Option<PathBuf>) -> Result<i32, HsError> {
+    let store = db::repository::Store::new(pool.clone());
+    import::run_import(&store, path)
 }
 
 /// Generate shell hook installation scripts for the chosen shell.
@@ -224,9 +226,9 @@ fn cmd_init(shell: Shell) {
 }
 
 /// Run health checks against the database and environment.
-fn cmd_doctor(pool: &DbPool) {
-    let _ = pool;
-    println!("Route: Doctor (not yet implemented)");
+fn cmd_doctor() -> Result<i32, HsError> {
+    let db_path = default_db_path()?;
+    Ok(doctor::run_doctor(&db_path))
 }
 
 /// Handle a capture event from the shell hooks.
@@ -234,6 +236,16 @@ fn cmd_capture(pool: &DbPool, cmd: &str, cwd: &str, exit: i32, duration_ms: i64)
     match capture::process_capture(pool, cmd, std::path::Path::new(cwd), exit, duration_ms) {
         Ok(()) => {}
         Err(e) => eprintln!("hs: capture failed: {e}"),
+    }
+}
+
+/// Pick the "no results" message, distinguishing a fresh install from an
+/// ordinary miss. `has_any_history` = the database holds ≥1 execution.
+fn no_results_message(has_any_history: bool) -> &'static str {
+    if has_any_history {
+        "No matching commands in history."
+    } else {
+        "No command history yet. Run some commands or run `hs import` to get started."
     }
 }
 
@@ -250,5 +262,18 @@ mod tests {
         assert_eq!(parse_time_window("1w"), Some(7));
         assert_eq!(parse_time_window("0"), None);
         assert_eq!(parse_time_window("garbage"), None);
+    }
+
+    #[test]
+    fn empty_state_message_guides_fresh_install() {
+        // No history at all → guide the user toward capture/import.
+        assert!(no_results_message(false).contains("hs import"));
+        assert_eq!(
+            no_results_message(false),
+            "No command history yet. Run some commands or run `hs import` to get started."
+        );
+        // History exists but nothing matched → plain "no results".
+        assert!(no_results_message(true).contains("No matching"));
+        assert!(!no_results_message(true).contains("hs import"));
     }
 }

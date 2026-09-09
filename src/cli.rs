@@ -4,6 +4,7 @@
 //! The routing logic that dispatches to subsystems lives in [`crate::main`].
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 /// `hs` — What worked here before?
 ///
@@ -173,10 +174,16 @@ pub enum Commands {
 
     /// Import standard shell history into the hs database.
     ///
-    /// Reads from `~/.bash_history` or `~/.zsh_history` and bulk-inserts
-    /// commands. Duplicate commands are merged (a new execution record is
-    /// added). Secrets are redacted before persistence.
-    Import,
+    /// Reads from `~/.bash_history` or `~/.zsh_history` (auto-detected)
+    /// and bulk-inserts commands inside a single transaction. Duplicate
+    /// commands are skipped, and secrets are redacted before persistence.
+    /// Pass an explicit `PATH` to import from any history file.
+    Import {
+        /// History file to import (default: auto-detect
+        /// `~/.zsh_history` / `~/.bash_history`).
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    },
 
     /// Generate shell hook installation scripts.
     ///
@@ -350,7 +357,21 @@ mod tests {
     #[test]
     fn parse_import_subcommand() {
         let cli = Cli::try_parse_from(["hs", "import"]).unwrap();
-        assert!(matches!(cli.command.unwrap(), Commands::Import));
+        match cli.command.unwrap() {
+            Commands::Import { path } => assert!(path.is_none()),
+            _ => panic!("expected Import"),
+        }
+    }
+
+    #[test]
+    fn parse_import_with_explicit_path() {
+        let cli = Cli::try_parse_from(["hs", "import", "~/backup/history.bak"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Import { path } => {
+                assert_eq!(path, Some(PathBuf::from("~/backup/history.bak")))
+            }
+            _ => panic!("expected Import"),
+        }
     }
 
     #[test]

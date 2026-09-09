@@ -13,6 +13,21 @@ use comfy_table::{Cell, Color, Table};
 
 use crate::ranking::RankedCommand;
 
+/// Maximum characters for a command shown in the one-line table/list.
+pub const MAX_DISPLAY_CHARS: usize = 64;
+
+/// Truncate `text` to at most `max_chars` display characters, appending
+/// `…` when cut. Never returns a string longer than `max_chars` — this is
+/// the guard against pathological 5,000-character commands exploding the
+/// CLI table (and, via the TUI list, the terminal).
+pub fn ellipsize(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
 /// Print a ranked list as a colored table to stdout.
 ///
 /// `current_project_id` (when `Some`) marks rows from *this* project so
@@ -44,7 +59,7 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
         let rank_marker = if in_project { "→" } else { " " };
         let cells: Vec<Cell> = vec![
             Cell::new(format!("{rank_marker}{}", i + 1)),
-            Cell::new(&r.cmd_string),
+            Cell::new(ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS)),
             Cell::new(format!("{:.2}", r.final_score)),
             Cell::new(total),
             Cell::new(success_rate),
@@ -113,6 +128,39 @@ mod tests {
     #[test]
     fn empty_results_prints_message_without_panicking() {
         print_results_table(&[], None);
+    }
+
+    #[test]
+    fn ellipsize_truncates_only_when_needed() {
+        assert_eq!(ellipsize("short", 10), "short");
+        assert_eq!(ellipsize("12345", 5), "12345");
+        assert_eq!(ellipsize("1234567890", 5), "1234…");
+        assert_eq!(ellipsize("1234567", 3), "12…");
+        // Character-aware: never splits a multibyte char.
+        assert_eq!(ellipsize("héllo wörld", 6), "héllo…");
+    }
+
+    #[test]
+    fn pathological_long_command_does_not_overflow_table() {
+        let mut cmd = String::with_capacity(5000);
+        for _ in 0..5000 {
+            cmd.push('x');
+        }
+        let truncated = ellipsize(&cmd, MAX_DISPLAY_CHARS);
+        assert_eq!(truncated.chars().count(), MAX_DISPLAY_CHARS);
+        assert!(truncated.ends_with('…'));
+
+        let rows = vec![RankedCommand {
+            command_id: 1,
+            cmd_string: cmd,
+            project_id: None,
+            final_score: 1.0,
+            success_count: 1,
+            fail_count: 0,
+            last_executed_at: Some("2026-09-08T10:11:12Z".to_string()),
+        }];
+        // Rendering must not panic or emit the full command.
+        print_results_table(&rows, None);
     }
 
     #[test]

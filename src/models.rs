@@ -88,3 +88,24 @@ pub struct Pin {
     /// UTC timestamp when the pin was created.
     pub pinned_at: DateTime<Utc>,
 }
+
+/// A single record being bulk-imported from legacy shell history.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportEntry {
+    /// The command string (pre-redaction).
+    pub cmd: String,
+    /// Timestamp from zsh extended history, `None` if unknown
+    /// (bash history, or entries without a header).
+    pub executed_at: Option<DateTime<Utc>>,
+}
+
+/// Outcome of a bulk history import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportReport {
+    /// Number of new commands persisted (each with one execution row).
+    pub imported: u64,
+    /// Number of history lines whose command already existed.
+    pub duplicates: u64,
+    /// Number of commands that were altered by secret redaction.
+    pub redacted: u64,
+}

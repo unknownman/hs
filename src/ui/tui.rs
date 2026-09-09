@@ -21,6 +21,7 @@ use ratatui::{Frame, Terminal};
 use crate::context::{RiskLevel, analyze_risk};
 use crate::error::HsError;
 use crate::ranking::RankedCommand;
+use crate::ui::format::{MAX_DISPLAY_CHARS, ellipsize};
 
 /// Section headers shown between logically grouped command rows.
 const HEADER_CURRENT: &str = "── Current project ─────────────────────────";
@@ -178,7 +179,10 @@ fn render(
                 } else {
                     Style::default().fg(Color::White)
                 };
-                ListItem::new(results[*idx].cmd_string.as_str()).style(style)
+                // One-line list cell: truncate pathological commands to a
+                // safe display width. The preview panel below shows the
+                // full text (wrapped).
+                ListItem::new(ellipsize(&results[*idx].cmd_string, MAX_DISPLAY_CHARS)).style(style)
             }
         })
         .collect();
@@ -348,5 +352,39 @@ mod tests {
             "section header must render"
         );
         assert!(text.contains("Preview"), "preview panel must render");
+    }
+
+    /// Phase 8 hardening: a 5,000-character multiline command must render
+    /// without panicking — truncated to the ellipsis in the list cell
+    /// while still drawing safely.
+    #[test]
+    fn renders_5000_char_multiline_command_without_overflow() {
+        use ratatui::backend::TestBackend;
+
+        let mut cmd = String::new();
+        for i in 0..5000 {
+            cmd.push(if i % 100 == 0 { '\n' } else { 'a' });
+        }
+        let results = vec![sample(&cmd, Some(3))];
+        let rows = build_rows(&results, Some(3));
+        let mut state = ListState::default();
+        state.select(Some(1)); // select the (only) command row
+
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &results, Some(3), &rows, &mut state))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().content();
+        // The list cell is ellipsized: the buffer must NOT echo 5000 chars
+        // anywhere. First list row is the Preview panel's wrapped command —
+        // even wrapped, it can only span the 24-row screen.
+        assert!(
+            buffer.len() < 5000,
+            "5,000-char command must never be echoed verbatim into the buffer"
+        );
+        let text: String = buffer.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains('…'), "list cell must show the ellipsis");
+        assert!(text.contains("Preview"), "preview must wrap the full text");
     }
 }
