@@ -1,0 +1,352 @@
+//! Interactive terminal UI for `hs`.
+//!
+//! A `ratatui`-based, dependency-free-of-ratatui-on-the-hot-path browser:
+//! a scrollable ranked list on top, and a preview panel below showing
+//! the full command, its stats, and its risk classification.
+//!
+//! Keys: `↑`/`↓` navigate · `Enter` run · `Esc`/`Ctrl-C` abort.
+//!
+//! `ratatui::init()`/`restore()` manage raw mode + the alternate screen
+//! and (via the installed panic hook) guarantee the terminal is restored
+//! even if rendering panics.
+
+use std::io;
+use std::time::Duration;
+
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::{Frame, Terminal};
+
+use crate::context::{RiskLevel, analyze_risk};
+use crate::error::HsError;
+use crate::ranking::RankedCommand;
+
+/// Section headers shown between logically grouped command rows.
+const HEADER_CURRENT: &str = "── Current project ─────────────────────────";
+const HEADER_GLOBAL: &str = "── Global / other ──────────────────────────";
+
+/// One visual row in the main list.
+#[derive(Debug, PartialEq)]
+enum Row {
+    /// Section header (not selectable).
+    Header(&'static str),
+    /// A command result (index into the ranked slice).
+    Command(usize),
+}
+
+/// Run the interactive browser and return the chosen command string.
+///
+/// * `Ok(Some(cmd))` — user pressed `Enter` on a row.
+/// * `Ok(None)` — user aborted with `Esc`/`Ctrl-C`.
+pub fn run(
+    results: &[RankedCommand],
+    current_project_id: Option<i64>,
+) -> Result<Option<String>, HsError> {
+    if results.is_empty() {
+        return Ok(None);
+    }
+
+    let terminal = ratatui::init();
+    let outcome = event_loop(terminal, results, current_project_id);
+    ratatui::restore();
+    outcome
+}
+
+fn event_loop(
+    mut terminal: Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>,
+    results: &[RankedCommand],
+    current_project_id: Option<i64>,
+) -> Result<Option<String>, HsError> {
+    use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
+
+    let rows = build_rows(results, current_project_id);
+    let selection_slots = rows
+        .iter()
+        .map(|r| match r {
+            Row::Command(idx) => Some(*idx),
+            Row::Header(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    let mut state = ListState::default();
+    state.select(Some(next_row(&selection_slots, None, 1)));
+
+    loop {
+        terminal.draw(|frame| {
+            render(frame, results, current_project_id, &rows, &mut state);
+        })?;
+
+        if !poll(Duration::from_millis(100))? {
+            continue;
+        }
+
+        match read()? {
+            Event::Key(key) => match key.code {
+                KeyCode::Down => {
+                    state.select(Some(next_row(&selection_slots, state.selected(), 1)))
+                }
+                KeyCode::Up => state.select(Some(next_row(&selection_slots, state.selected(), -1))),
+                KeyCode::Enter => {
+                    if let Some(idx) = state.selected().and_then(|row| selection_slots[row]) {
+                        return Ok(Some(results[idx].cmd_string.clone()));
+                    }
+                }
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(None);
+                }
+                _ => {}
+            },
+            Event::Resize(_, _) | Event::Paste(_) | Event::FocusGained | Event::FocusLost => {}
+            _ => {}
+        }
+    }
+}
+
+/// Wrap-around, header-skipping row navigation.
+fn next_row(slots: &[Option<usize>], current: Option<usize>, delta: i32) -> usize {
+    let n = slots.len();
+    if n == 0 || !slots.iter().any(Option::is_some) {
+        return 0;
+    }
+    let mut next = (current.unwrap_or(0) as i64 + delta as i64).rem_euclid(n as i64) as usize;
+    while slots[next].is_none() {
+        next = (next as i64 + delta as i64).rem_euclid(n as i64) as usize;
+    }
+    next
+}
+
+/// Build the visual rows: "Current project" commands first (bold/green),
+/// then "Global / other", each group introduced by a header.
+fn build_rows(results: &[RankedCommand], current_project_id: Option<i64>) -> Vec<Row> {
+    let mut current: Vec<usize> = Vec::new();
+    let mut other: Vec<usize> = Vec::new();
+    for (i, r) in results.iter().enumerate() {
+        if current_project_id.is_some() && r.project_id == current_project_id {
+            current.push(i);
+        } else {
+            other.push(i);
+        }
+    }
+
+    let mut rows: Vec<Row> = Vec::with_capacity(results.len() + 2);
+    let mut push_group = |label: &'static str, indices: &[usize]| {
+        if indices.is_empty() {
+            return;
+        }
+        rows.push(Row::Header(label));
+        rows.extend(indices.iter().map(|i| Row::Command(*i)));
+    };
+    push_group(HEADER_CURRENT, &current);
+    push_group(HEADER_GLOBAL, &other);
+
+    if rows.is_empty() {
+        rows.push(Row::Command(0));
+    }
+    rows
+}
+
+fn render(
+    frame: &mut Frame,
+    results: &[RankedCommand],
+    current_project_id: Option<i64>,
+    rows: &[Row],
+    state: &mut ListState,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(frame.area());
+
+    // ── Main: the ranked list ────────────────────────────────────────
+    let list_items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| match row {
+            Row::Header(label) => ListItem::new(*label).style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Row::Command(idx) => {
+                let in_project =
+                    current_project_id.is_some() && results[*idx].project_id == current_project_id;
+                let style = if in_project {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(results[*idx].cmd_string.as_str()).style(style)
+            }
+        })
+        .collect();
+
+    let list = List::new(list_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" hs — What worked here before? "),
+        )
+        .highlight_style(Style::default().bg(Color::Blue).fg(Color::Black))
+        .highlight_symbol("▶ ");
+    frame.render_stateful_widget(list, chunks[0], state);
+
+    // ── Preview: details for the highlighted command ─────────────────
+    let selected = state
+        .selected()
+        .and_then(|row| match rows[row] {
+            Row::Command(idx) => Some(idx),
+            Row::Header(_) => None,
+        })
+        .and_then(|idx| results.get(idx));
+
+    let preview = match selected {
+        Some(r) => {
+            let risk = analyze_risk(&r.cmd_string);
+            let total = r.success_count + r.fail_count;
+            let rate = if total == 0 {
+                "–".to_string()
+            } else {
+                format!("{:.0}%", 100.0 * r.success_count as f64 / total as f64)
+            };
+            let risk_color = match risk {
+                RiskLevel::Safe => Color::Green,
+                RiskLevel::High => Color::Red,
+            };
+            let risk_label = match risk {
+                RiskLevel::Safe => "SAFE",
+                RiskLevel::High => "HIGH RISK",
+            };
+
+            let lines = vec![
+                ratatui::text::Line::from(format!(
+                    "Score {:.2}  ·  {} run(s)  ·  success rate {}  ·  last: {}",
+                    r.final_score,
+                    total,
+                    rate,
+                    r.last_executed_at.as_deref().unwrap_or("never"),
+                )),
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from(r.cmd_string.as_str()),
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!("  {risk_label}  "),
+                    Style::default().fg(Color::Black).bg(risk_color),
+                )),
+            ];
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(" Preview "))
+                .wrap(Wrap { trim: true })
+        }
+        None => Paragraph::new("Select a command with ↑/↓, then press Enter to run it.")
+            .block(Block::default().borders(Borders::ALL).title(" Preview ")),
+    };
+    frame.render_widget(preview, chunks[1]);
+
+    // ── Footer hints ─────────────────────────────────────────────────
+    let hints = Paragraph::new("↑/↓ navigate   Enter run   Esc / Ctrl-C exit")
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(hints, chunks[1]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(cmd: &str, project_id: Option<i64>) -> RankedCommand {
+        RankedCommand {
+            command_id: 1,
+            cmd_string: cmd.to_string(),
+            project_id,
+            final_score: 1.0,
+            success_count: 3,
+            fail_count: 0,
+            last_executed_at: Some("2026-09-08T10:11:12Z".to_string()),
+        }
+    }
+
+    #[test]
+    fn next_row_skips_headers_and_wraps() {
+        // rows: header, cmd0, header, cmd1, cmd2
+        let slots = vec![None, Some(0), None, Some(1), Some(2)];
+        assert_eq!(next_row(&slots, Some(1), 1), 3); // skip header
+        assert_eq!(next_row(&slots, Some(4), 1), 1); // wrap to cmd0
+        assert_eq!(next_row(&slots, Some(1), -1), 4); // wrap backwards
+        assert_eq!(next_row(&slots, Some(3), -1), 1);
+    }
+
+    #[test]
+    fn next_row_handles_empty_and_all_headers() {
+        assert_eq!(next_row(&[], Some(0), 1), 0);
+        assert_eq!(next_row(&[None, None], None, 1), 0);
+    }
+
+    #[test]
+    fn build_rows_groups_by_project() {
+        let results = vec![
+            sample("in proj", Some(3)),
+            sample("outside", None),
+            sample("other proj", Some(9)),
+        ];
+        let rows = build_rows(&results, Some(3));
+
+        // header(current) + cmd0 + header(global) + cmd1 + cmd2
+        let slots: Vec<Option<usize>> = rows
+            .iter()
+            .map(|r| match r {
+                Row::Command(i) => Some(*i),
+                Row::Header(_) => None,
+            })
+            .collect();
+        assert_eq!(slots, vec![None, Some(0), None, Some(1), Some(2)]);
+
+        // Current-project command must be mapped first.
+        assert_eq!(
+            rows[1],
+            Row::Command(0),
+            "current project command should lead the list"
+        );
+    }
+
+    #[test]
+    fn empty_results_returns_none_without_panicking() {
+        assert_eq!(run(&[], None).unwrap(), None);
+    }
+
+    #[test]
+    fn renders_without_panicking() {
+        use ratatui::backend::TestBackend;
+
+        let results = vec![
+            sample("cargo build --release", Some(3)),
+            sample("docker build -t app .", None),
+        ];
+        let rows = build_rows(&results, Some(3));
+        let mut state = ListState::default();
+        state.select(Some(1)); // first command row
+
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &results, Some(3), &rows, &mut state))
+            .unwrap();
+
+        // Both groups + both commands must be drawn somewhere.
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("cargo build --release"), "list must render");
+        assert!(text.contains("docker build -t app ."), "list must render");
+        assert!(
+            text.contains("Current project"),
+            "section header must render"
+        );
+        assert!(text.contains("Preview"), "preview panel must render");
+    }
+}

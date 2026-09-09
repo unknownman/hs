@@ -28,6 +28,9 @@ pub enum HsError {
 
     #[error("r2d2 pool error: {0}")]
     PoolError(String),
+
+    #[error("execution cancelled by user")]
+    Cancelled,
 }
 
 impl From<r2d2::Error> for HsError {

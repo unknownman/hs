@@ -107,6 +107,15 @@ pub struct Cli {
     )]
     pub failed: bool,
 
+    // ── Presentation ────────────────────────────────────────────────
+    /// Print ranked results as a table and exit.
+    ///
+    /// Bypasses the interactive TUI (and the auto-execute path) — useful
+    /// for piping output or scripting. Results are also printed
+    /// automatically when stdout is not a terminal.
+    #[arg(long, help = "Print results as a table and exit (no TUI)")]
+    pub print: bool,
+
     // ── Time window ────────────────────────────────────────────────
     /// Only show commands from the last time window.
     ///
@@ -302,6 +311,16 @@ mod tests {
     fn parse_repeatable_tags() {
         let cli = Cli::try_parse_from(["hs", "-t", "cargo", "-t", "docker", "build"]).unwrap();
         assert_eq!(cli.tags, vec!["cargo", "docker"]);
+    }
+
+    #[test]
+    fn parse_print_flag() {
+        let cli = Cli::try_parse_from(["hs", "--print", "docker", "build"]).unwrap();
+        assert!(cli.print);
+        assert_eq!(
+            cli.query,
+            Some(vec!["docker".to_string(), "build".to_string()])
+        );
     }
 
     #[test]

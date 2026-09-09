@@ -9,10 +9,12 @@
 #![allow(dead_code)]
 
 use rusqlite::params;
+use rusqlite::types::Value;
 
 use crate::db::DbPool;
 use crate::error::HsError;
 use crate::models::{CommandStats, cmd_hash, dir_hash};
+use crate::ranking::{RawCandidate, SearchContext};
 
 /// High-level interface over the SQLite persistence layer.
 ///
@@ -96,6 +98,98 @@ impl Store {
         Ok(())
     }
 
+    /// Fetch raw candidates for ranking (Phase 6 recall halving).
+    ///
+    /// Builds a dynamic SQL query applying the hard filters in
+    /// [`SearchContext`]:
+    ///
+    /// * FTS5 `MATCH` (with its `bm25` score) when a query is present;
+    ///   a `1.0` sentinel score when not.
+    /// * Project scoping (unless `global`).
+    /// * Success / failure filters (`--ok`, `--failed`).
+    /// * Recency window (`--last`).
+    ///
+    /// At most ~500 rows are returned — all complex scoring math is left
+    /// to [`crate::ranking::rank_commands`].
+    pub fn fetch_candidates(&self, ctx: &SearchContext) -> Result<Vec<RawCandidate>, HsError> {
+        let conn = self.pool.get()?;
+
+        let mut sql = String::from(
+            "SELECT c.id, c.cmd_string, c.project_id,
+                    s.success_count, s.fail_count, s.last_executed_at,",
+        );
+
+        let mut wheres: Vec<String> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+
+        if let Some(query) = ctx.query.as_deref() {
+            sql.push_str(
+                " bm25(commands_fts) AS bm
+                FROM commands c
+                INNER JOIN commands_fts ON commands_fts.rowid = c.id
+                LEFT JOIN command_stats s ON s.command_id = c.id",
+            );
+            wheres.push("commands_fts MATCH ?".to_string());
+            values.push(Value::Text(sanitize_fts_query(query)));
+        } else {
+            sql.push_str(
+                " 1.0 AS bm
+                FROM commands c
+                LEFT JOIN command_stats s ON s.command_id = c.id",
+            );
+        }
+
+        // Hard project filter (only active in non-global mode).
+        if !ctx.global
+            && let Some(project_id) = ctx.current_project_id
+        {
+            wheres.push("c.project_id = ?".to_string());
+            values.push(Value::from(project_id));
+        }
+
+        // Outcome filters.
+        if ctx.ok_only {
+            wheres.push("s.fail_count = 0 AND s.success_count > 0".to_string());
+        }
+        if ctx.failed_only {
+            wheres.push("s.fail_count > 0".to_string());
+        }
+
+        // Recency filter.  Mirrors the storage format exactly so text
+        // comparison is lexically ordered.
+        if let Some(days) = ctx.time_window_days {
+            wheres
+                .push("s.last_executed_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)".to_string());
+            values.push(Value::Text(format!("-{days} days")));
+        }
+
+        if !wheres.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&wheres.join(" AND "));
+        }
+
+        sql.push_str(" ORDER BY c.id LIMIT 500");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
+            let last_raw: Option<String> = row.get(5)?;
+            let last_executed_at = last_raw
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+            Ok(RawCandidate {
+                command_id: row.get(0)?,
+                cmd_string: row.get(1)?,
+                project_id: row.get(2)?,
+                success_count: row.get(3)?,
+                fail_count: row.get(4)?,
+                last_executed_at,
+                bm25: row.get(6)?,
+            })
+        })?;
+
+        rows.collect::<Result<Vec<_>, _>>().map_err(HsError::from)
+    }
+
     /// Pin a command so it resists rank decay in search results.
     pub fn pin_command(&self, command_id: i64) -> Result<(), HsError> {
         let conn = self.pool.get()?;
@@ -104,6 +198,24 @@ impl Store {
             params![command_id],
         )?;
         Ok(())
+    }
+
+    /// Resolve the internal project id for a project root path.
+    ///
+    /// Returns `None` if the project has never been seen (no commands
+    /// captured under it yet). Used to establish search context.
+    pub fn get_project_id_by_path(&self, path: &str) -> Result<Option<i64>, HsError> {
+        use rusqlite::OptionalExtension;
+        let conn = self.pool.get()?;
+        let hash = dir_hash(path);
+        let id = conn
+            .query_row(
+                "SELECT id FROM projects WHERE dir_hash = ?1",
+                params![hash],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(id)
     }
 
     /// Remove a pin from a previously pinned command.
@@ -146,15 +258,52 @@ impl Store {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
+/// Quote each whitespace-separated token so FTS5 treats it as a literal
+/// (AND'd) phrase term instead of parsing operators/column filters out of
+/// user input. Embedded double quotes are escaped by doubling (FTS5 rule).
+fn sanitize_fts_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|token| format!("\"{}\"", token.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::ranking::{SearchContext, rank_commands};
 
     /// Convenience: build a [`Store`] backed by an in-memory database
     /// with all migrations applied.
     fn test_store() -> Store {
         let pool = crate::db::tests::test_pool();
         Store::new(pool)
+    }
+
+    /// Resolve a single command id by string + owning project path,
+    /// releasing the connection promptly (test pool is `max_size(1)`).
+    fn command_id(store: &Store, string: &str, project: Option<&str>) -> i64 {
+        let conn = store.pool.get().unwrap();
+        match project {
+            Some(path) => conn
+                .query_row(
+                    "SELECT c.id FROM commands c
+                     JOIN projects p ON p.id = c.project_id
+                     WHERE c.cmd_string = ?1 AND p.path = ?2",
+                    [string, path],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+            None => conn
+                .query_row(
+                    "SELECT id FROM commands WHERE cmd_string = ?1",
+                    [string],
+                    |r| r.get(0),
+                )
+                .unwrap(),
+        }
     }
 
     #[test]
@@ -351,5 +500,355 @@ mod tests {
             )
             .unwrap();
         assert_eq!(project_id, None, "project_id should be NULL");
+    }
+
+    // ── Phase 6: recall & ranking acceptance tests ────────────────────
+
+    /// Acceptance 1: identical command strings in two projects; the
+    /// command from the *current* project (the successful one) must win
+    /// a global search via the project boost.
+    #[test]
+    fn contextual_order_prefers_current_project() {
+        let store = test_store();
+        store
+            .insert_execution(Some("/proj/a"), "deploy prod", 0, 100, "/proj/a")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj/b"), "deploy prod", 1, 100, "/proj/b")
+            .unwrap();
+
+        let conn = store.pool.get().unwrap();
+        let project_a: i64 = conn
+            .query_row("SELECT id FROM projects WHERE path = '/proj/a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        drop(conn);
+
+        let cmd_a = command_id(&store, "deploy prod", Some("/proj/a"));
+        let cmd_b = command_id(&store, "deploy prod", Some("/proj/b"));
+
+        let ctx = SearchContext {
+            query: None,
+            current_project_id: Some(project_a),
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window_days: None,
+        };
+
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        assert_eq!(candidates.len(), 2, "both projects returned");
+
+        let ranked = rank_commands(candidates, Some(project_a));
+        assert_eq!(ranked[0].command_id, cmd_a, "current-project cmd first");
+        assert_eq!(ranked[1].command_id, cmd_b);
+
+        // Stats are surfaced for the UI.
+        assert_eq!(ranked[0].success_count, 1);
+        assert_eq!(ranked[0].fail_count, 0);
+        assert_eq!(ranked[1].success_count, 0);
+        assert_eq!(ranked[1].fail_count, 1);
+    }
+
+    /// Acceptance 2: in the same project, a reliable "deploy app" must
+    /// crush an unreliable one.
+    ///
+    /// Note: identical strings dedupe to one command row per project, so
+    /// the two aliases differ slightly.
+    #[test]
+    fn success_overrides_failure_rank() {
+        let store = test_store();
+
+        // "deploy app": 1 success, 5 failures (unreliable).
+        store
+            .insert_execution(Some("/proj"), "deploy app", 0, 100, "/proj")
+            .unwrap();
+        for _ in 0..5 {
+            store
+                .insert_execution(Some("/proj"), "deploy app", 1, 100, "/proj")
+                .unwrap();
+        }
+        // "deploy app --prod": 5 successes, 0 failures (reliable).
+        for _ in 0..5 {
+            store
+                .insert_execution(Some("/proj"), "deploy app --prod", 0, 100, "/proj")
+                .unwrap();
+        }
+
+        let conn = store.pool.get().unwrap();
+        let project: i64 = conn
+            .query_row("SELECT id FROM projects WHERE path = '/proj'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        drop(conn);
+
+        let reliable = command_id(&store, "deploy app --prod", Some("/proj"));
+        let unreliable = command_id(&store, "deploy app", Some("/proj"));
+
+        let ctx = SearchContext {
+            query: None,
+            current_project_id: Some(project),
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window_days: None,
+        };
+
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        let ranked = rank_commands(candidates, Some(project));
+
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].command_id, reliable);
+        assert_eq!(ranked[1].command_id, unreliable);
+        // 5/0 (× 1.2) vs 1/5 (× 0.5): must be a decisive gap, not a tie.
+        assert!(
+            ranked[0].final_score > ranked[1].final_score * 2.0,
+            "reliable must score >2x unreliable: {} vs {}",
+            ranked[0].final_score,
+            ranked[1].final_score
+        );
+    }
+
+    /// Acceptance 3: two reliable commands, one run 2h ago, one 100 days
+    /// ago — recency must decide.
+    #[test]
+    fn recency_ranks_recent_command_first() {
+        let store = test_store();
+
+        store
+            .insert_execution(Some("/proj"), "recent probe", 0, 100, "/proj")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "stale probe", 0, 100, "/proj")
+            .unwrap();
+        // Equal run counts so the frequency multiplier cancels out.
+        store
+            .insert_execution(Some("/proj"), "recent probe", 0, 100, "/proj")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "stale probe", 0, 100, "/proj")
+            .unwrap();
+
+        let project = {
+            let conn = store.pool.get().unwrap();
+            conn.query_row("SELECT id FROM projects WHERE path = '/proj'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        let recent = command_id(&store, "recent probe", Some("/proj"));
+        let stale = command_id(&store, "stale probe", Some("/proj"));
+
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "UPDATE command_stats SET last_executed_at =
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2 hours')  WHERE command_id = ?1",
+                [recent],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE command_stats SET last_executed_at =
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-100 days') WHERE command_id = ?1",
+                [stale],
+            )
+            .unwrap();
+        }
+
+        let ctx = SearchContext {
+            query: None,
+            current_project_id: Some(project),
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window_days: None,
+        };
+
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        assert_eq!(candidates.len(), 2);
+        let ranked = rank_commands(candidates, Some(project));
+
+        assert_eq!(ranked[0].command_id, recent);
+        assert_eq!(ranked[1].command_id, stale);
+        // Exact expected ratio: (1.5 / 0.8) × (freq identical) = 1.875.
+        assert!(
+            (ranked[0].final_score / ranked[1].final_score - 1.875).abs() < 1e-9,
+            "recency ratio: {}",
+            ranked[0].final_score / ranked[1].final_score
+        );
+    }
+
+    /// FTS recall: query filtering narrows candidates and yields real
+    /// (negative) bm25 values that the ranker inverts.
+    #[test]
+    fn query_filters_via_fts_and_scores() {
+        let store = test_store();
+
+        store
+            .insert_execution(Some("/proj"), "cargo build", 0, 100, "/proj")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "cargo test", 0, 100, "/proj")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "make build", 0, 100, "/proj")
+            .unwrap();
+
+        let ctx = SearchContext {
+            query: Some("cargo".to_string()),
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window_days: None,
+        };
+
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        assert_eq!(candidates.len(), 2, "only 'cargo' rows should match");
+        assert!(
+            candidates.iter().all(|c| c.cmd_string.starts_with("cargo")),
+            "FTS must filter to matching commands"
+        );
+        // Real FTS bm25 scores are negative; the sentinel is 1.0.
+        assert!(
+            candidates.iter().all(|c| c.bm25 <= 0.0),
+            "bm25 should be negative for a real query"
+        );
+
+        let ranked = rank_commands(candidates, None);
+        assert_eq!(ranked.len(), 2);
+        assert!(ranked[0].final_score > 0.0);
+    }
+
+    /// Regression: raw user input full of FTS5 syntax (hyphens, colons,
+    /// operators) must not be parsed as operators — it is quoted per token.
+    #[test]
+    fn query_with_fts_special_chars_is_quoted() {
+        let store = test_store();
+        store
+            .insert_execution(
+                Some("/proj"),
+                "echo hello-from-hs-project --force",
+                0,
+                100,
+                "/proj",
+            )
+            .unwrap();
+
+        let ctx = SearchContext {
+            query: Some("echo hello-from-hs-project  --force".to_string()),
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window_days: None,
+        };
+
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "hyphenated command must be found despite raw FTS5 syntax"
+        );
+        assert_eq!(
+            candidates[0].cmd_string,
+            "echo hello-from-hs-project --force"
+        );
+    }
+
+    /// Hard filters: --ok / --failed narrow candidate sets correctly.
+    #[test]
+    fn outcome_filters_narrow_candidates() {
+        let store = test_store();
+        store
+            .insert_execution(None, "good cmd", 0, 10, "/tmp")
+            .unwrap();
+        store
+            .insert_execution(None, "bad cmd", 1, 10, "/tmp")
+            .unwrap();
+
+        let ok_ctx = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: true,
+            failed_only: false,
+            time_window_days: None,
+        };
+        let ok = store.fetch_candidates(&ok_ctx).unwrap();
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].cmd_string, "good cmd");
+
+        let failed_ctx = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: true,
+            time_window_days: None,
+        };
+        let failed = store.fetch_candidates(&failed_ctx).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].cmd_string, "bad cmd");
+    }
+
+    /// Hard filters: non-global mode scopes to one project; --last
+    /// trims by last_executed_at.
+    #[test]
+    fn project_and_time_window_filters() {
+        let store = test_store();
+        store
+            .insert_execution(Some("/proj/a"), "from a", 0, 10, "/proj/a")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj/b"), "from b", 0, 10, "/proj/b")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj/b"), "fresh b", 0, 10, "/proj/b")
+            .unwrap();
+
+        let conn = store.pool.get().unwrap();
+        let project_b: i64 = conn
+            .query_row("SELECT id FROM projects WHERE path = '/proj/b'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        // Age "fresh b" instantly so the window can prune it.
+        conn.execute(
+            "UPDATE command_stats SET last_executed_at =
+                 strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-8 days') WHERE command_id = (
+                     SELECT id FROM commands WHERE cmd_string = 'fresh b'
+                 )",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Non-global scoping.
+        let scoped = SearchContext {
+            query: None,
+            current_project_id: Some(project_b),
+            global: false,
+            ok_only: false,
+            failed_only: false,
+            time_window_days: None,
+        };
+        let scoped_cands = store.fetch_candidates(&scoped).unwrap();
+        assert_eq!(scoped_cands.len(), 2, "only project B commands");
+
+        // Same scope + a 3-day window excludes the 8-day-old command.
+        let windowed = SearchContext {
+            query: None,
+            current_project_id: Some(project_b),
+            global: false,
+            ok_only: false,
+            failed_only: false,
+            time_window_days: Some(3),
+        };
+        let windowed_cands = store.fetch_candidates(&windowed).unwrap();
+        assert_eq!(windowed_cands.len(), 1, "window prunes stale command");
+        assert_eq!(windowed_cands[0].cmd_string, "from b");
     }
 }
