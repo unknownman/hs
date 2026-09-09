@@ -1,9 +1,11 @@
 //! `hs` — a fast, private, project-aware shell history tool.
 
 mod cli;
+mod context;
 mod db;
 mod error;
 mod models;
+mod redaction;
 
 use std::path::PathBuf;
 
