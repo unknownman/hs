@@ -171,10 +171,15 @@ pub enum Commands {
 
     /// Generate shell hook installation scripts.
     ///
-    /// Prints the `preexec`/`precmd` hook code for bash or zsh that
-    /// should be appended to your shell RC file. These hooks enable
-    /// silent background capture of every command you run.
-    Init,
+    /// Prints the preexec/precmd hook code for the chosen shell to
+    /// stdout, pure and side-effect free, so it can be piped straight
+    /// into your rc file:
+    /// `eval "$(hs init zsh)"`.
+    Init {
+        /// Which shell to generate hooks for.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 
     /// Check database health and configuration.
     ///
@@ -184,31 +189,28 @@ pub enum Commands {
     /// are correct.
     Doctor,
 
-    /// (Internal) Capture a command execution — called by shell hooks.
+    /// (Internal) Capture a completed command execution — called by shell hooks.
     ///
-    /// This subcommand is invoked automatically by the bash/zsh hooks
-    /// and is not intended for direct use.
+    /// Stateless one-shot endpoint: the shell hook backgrounds this
+    /// command *after* the user's command finishes, so the prompt is
+    /// never blocked — even if the database is momentarily busy.
     #[command(hide = true)]
     Capture {
-        /// Hook phase: run before the command executes.
-        #[arg(long, conflicts_with = "preexec", required_unless_present = "preexec")]
-        precmd: bool,
-
-        /// Hook phase: run after the command completes.
-        #[arg(long, conflicts_with = "precmd", required_unless_present = "precmd")]
-        preexec: bool,
-
-        /// The command string that was (or is about to be) executed.
+        /// The command string that was executed.
         #[arg(long, value_name = "STRING")]
         cmd: String,
 
-        /// The working directory at execution time.
+        /// The working directory of the shell at execution time.
         #[arg(long, value_name = "PATH")]
         cwd: String,
 
-        /// The process exit code (only meaningful in --preexec phase).
+        /// The process exit code (0 = success).
         #[arg(long, value_name = "CODE", default_value_t = 0)]
         exit: i32,
+
+        /// Wall-clock duration of the command in milliseconds.
+        #[arg(long = "duration-ms", value_name = "MS", default_value_t = 0)]
+        duration_ms: i64,
     },
 }
 
@@ -228,6 +230,15 @@ pub enum Outcome {
     Ok,
     /// Only failed commands (exit code > 0).
     Failed,
+}
+
+/// Shells supported by `hs init`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Shell {
+    /// Bash — uses a DEBUG trap + `PROMPT_COMMAND`.
+    Bash,
+    /// Zsh — uses `preexec`/`precmd` hooks.
+    Zsh,
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -325,8 +336,17 @@ mod tests {
 
     #[test]
     fn parse_init_subcommand() {
-        let cli = Cli::try_parse_from(["hs", "init"]).unwrap();
-        assert!(matches!(cli.command.unwrap(), Commands::Init));
+        let cli = Cli::try_parse_from(["hs", "init", "zsh"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Init { shell } => assert_eq!(shell, Shell::Zsh),
+            _ => panic!("expected Init"),
+        }
+    }
+
+    #[test]
+    fn init_requires_shell() {
+        let result = Cli::try_parse_from(["hs", "init"]);
+        assert!(result.is_err(), "init must require a shell argument");
     }
 
     #[test]
@@ -340,54 +360,50 @@ mod tests {
         let cli = Cli::try_parse_from([
             "hs",
             "capture",
-            "--preexec",
             "--cmd",
             "docker build .",
             "--cwd",
             "/tmp",
             "--exit",
-            "0",
+            "1",
+            "--duration-ms",
+            "4321",
         ])
         .unwrap();
 
         match cli.command.unwrap() {
             Commands::Capture {
-                precmd,
-                preexec,
                 cmd,
                 cwd,
                 exit,
+                duration_ms,
             } => {
-                assert!(!precmd);
-                assert!(preexec);
                 assert_eq!(cmd, "docker build .");
                 assert_eq!(cwd, "/tmp");
-                assert_eq!(exit, 0);
+                assert_eq!(exit, 1);
+                assert_eq!(duration_ms, 4321);
             }
             _ => panic!("expected Capture"),
         }
     }
 
     #[test]
-    fn capture_precmd_preexec_conflict() {
-        let result = Cli::try_parse_from([
-            "hs",
-            "capture",
-            "--precmd",
-            "--preexec",
-            "--cmd",
-            "ls",
-            "--cwd",
-            "/tmp",
-        ]);
-        assert!(result.is_err(), "--precmd and --preexec must conflict");
-    }
-
-    #[test]
-    fn capture_requires_one_phase() {
-        // Neither --precmd nor --preexec provided → error.
-        let result = Cli::try_parse_from(["hs", "capture", "--cmd", "ls", "--cwd", "/tmp"]);
-        assert!(result.is_err(), "must require --precmd or --preexec");
+    fn capture_defaults() {
+        let cli = Cli::try_parse_from(["hs", "capture", "--cmd", "ls", "--cwd", "/tmp"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Capture {
+                cmd,
+                cwd,
+                exit,
+                duration_ms,
+            } => {
+                assert_eq!(cmd, "ls");
+                assert_eq!(cwd, "/tmp");
+                assert_eq!(exit, 0);
+                assert_eq!(duration_ms, 0);
+            }
+            _ => panic!("expected Capture"),
+        }
     }
 
     #[test]

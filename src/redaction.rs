@@ -115,14 +115,13 @@ mod tests {
         let input = "git commit -m \"sk_test_is_a_file\"";
         assert_eq!(sanitize_command(input), input);
     }
-#[test]
+    #[test]
     fn long_stripe_key_redacted() {
         // Build the fake try key at runtime so no secret-shaped literal
         // exists in source.  Real keys are `sk_test_` + 24 chars.
         let secret = format!("sk_test_{}{}", "4eC39HqLyjWDarjtT1z", "dp7dc");
         let input = format!("curl https://api.stripe.com/v1/charges -u {secret}:");
-        let expected =
-            "curl https://api.stripe.com/v1/charges -u [REDACTED]:";
+        let expected = "curl https://api.stripe.com/v1/charges -u [REDACTED]:";
         assert_eq!(sanitize_command(&input), expected);
     }
 

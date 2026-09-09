@@ -1,5 +1,6 @@
 //! `hs` — a fast, private, project-aware shell history tool.
 
+mod capture;
 mod cli;
 mod context;
 mod db;
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use tracing::info;
 
-use crate::cli::{Cli, Commands};
+use crate::cli::{Cli, Commands, Shell};
 use crate::db::DbPool;
 
 fn main() {
@@ -58,18 +59,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // ── Subcommands that do NOT need the database ───────────────
-        Some(Commands::Init) => cmd_init(),
+        Some(Commands::Init { shell }) => cmd_init(shell),
 
         // ── Hidden: capture (called by shell hooks) ─────────────────
         Some(Commands::Capture {
-            precmd,
-            preexec,
             cmd,
             cwd,
             exit,
+            duration_ms,
         }) => {
             let pool = get_pool()?;
-            cmd_capture(&pool, precmd, preexec, &cmd, &cwd, exit);
+            cmd_capture(&pool, &cmd, &cwd, exit, duration_ms);
         }
 
         // ── No subcommand: search or launch TUI ─────────────────────
@@ -156,9 +156,13 @@ fn cmd_import(pool: &DbPool) {
     println!("Route: Import");
 }
 
-/// Generate shell hook installation scripts.
-fn cmd_init() {
-    println!("Route: Init (not yet implemented)");
+/// Generate shell hook installation scripts for the chosen shell.
+fn cmd_init(shell: Shell) {
+    let script = match shell {
+        Shell::Bash => include_str!("../hooks/bash.sh"),
+        Shell::Zsh => include_str!("../hooks/zsh.sh"),
+    };
+    print!("{script}");
 }
 
 /// Run health checks against the database and environment.
@@ -168,11 +172,9 @@ fn cmd_doctor(pool: &DbPool) {
 }
 
 /// Handle a capture event from the shell hooks.
-fn cmd_capture(pool: &DbPool, _precmd: bool, preexec: bool, cmd: &str, cwd: &str, exit: i32) {
-    let _ = pool;
-    let phase = if preexec { "preexec" } else { "precmd" };
-    println!(
-        "Route: Capture | Phase: {} | Cmd: {:?} | Cwd: {} | Exit: {}",
-        phase, cmd, cwd, exit,
-    );
+fn cmd_capture(pool: &DbPool, cmd: &str, cwd: &str, exit: i32, duration_ms: i64) {
+    match capture::process_capture(pool, cmd, std::path::Path::new(cwd), exit, duration_ms) {
+        Ok(()) => {}
+        Err(e) => eprintln!("hs: capture failed: {e}"),
+    }
 }
