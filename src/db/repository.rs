@@ -1441,4 +1441,132 @@ mod tests {
         assert_eq!(ranked[1].command_id, popular_id);
         assert!(!ranked[1].is_pinned);
     }
+
+    /// Full pins lifecycle: insert → pin → list_pins returns it → rank
+    /// boosts to index 0 → unpin → list_pins empty → rank drops to
+    /// normal position.
+    #[test]
+    fn pins_lifecycle_insert_pin_list_rank_unpin() {
+        let store = test_store();
+
+        // Two commands in the same project: "alpha" and "beta".
+        // Both have one successful run so the only ranking signal is
+        // recency (set deterministically below).
+        store
+            .insert_execution(Some("/proj"), "alpha cmd", 0, 10, "/proj")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "beta cmd", 0, 10, "/proj")
+            .unwrap();
+
+        let alpha_id = command_id(&store, "alpha cmd", Some("/proj"));
+        let _beta_id = command_id(&store, "beta cmd", Some("/proj"));
+
+        // Backdate both to the same moment so recency is identical.
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "UPDATE command_stats SET last_executed_at = '2025-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // ── Step 1: nothing pinned yet ──────────────────────────────
+        let ctx = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: None,
+        };
+        let ranked = rank_commands(store.fetch_candidates(&ctx).unwrap(), None);
+        assert_eq!(ranked.len(), 2, "both commands returned");
+        // Same score → same sort position; neither is pinned.
+        assert!(ranked.iter().all(|r| !r.is_pinned));
+
+        // ── Step 2: pin "alpha" ─────────────────────────────────────
+        store.pin_command(alpha_id).unwrap();
+        let pins = store.list_pins().unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].command_id, alpha_id);
+        assert_eq!(pins[0].cmd_string, "alpha cmd");
+
+        let ranked = rank_commands(store.fetch_candidates(&ctx).unwrap(), None);
+        assert_eq!(ranked[0].command_id, alpha_id, "pinned alpha must be first");
+        assert!(ranked[0].is_pinned);
+
+        // ── Step 3: unpin "alpha" ───────────────────────────────────
+        store.unpin_command(alpha_id).unwrap();
+        let pins = store.list_pins().unwrap();
+        assert!(pins.is_empty(), "no pins after unpin");
+
+        let ranked = rank_commands(store.fetch_candidates(&ctx).unwrap(), None);
+        assert_eq!(ranked.len(), 2);
+        assert!(
+            ranked.iter().all(|r| !r.is_pinned),
+            "neither command pinned after unpin"
+        );
+    }
+
+    /// Sub-day window boundary: create two commands, backdate one to
+    /// `now - 20 minutes` and the other to `now - 2 hours`. A 30-minute
+    /// window must return only the recent one.
+    #[test]
+    fn sub_day_window_two_commands_boundary() {
+        let store = test_store();
+
+        store
+            .insert_execution(Some("/proj"), "fresh cmd", 0, 10, "/proj")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "stale cmd", 0, 10, "/proj")
+            .unwrap();
+
+        let fresh_id = command_id(&store, "fresh cmd", Some("/proj"));
+        let stale_id = command_id(&store, "stale cmd", Some("/proj"));
+
+        // Backdate to precise ages.
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "UPDATE command_stats SET last_executed_at =
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-20 minutes') WHERE command_id = ?1",
+                [fresh_id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE command_stats SET last_executed_at =
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-2 hours') WHERE command_id = ?1",
+                [stale_id],
+            )
+            .unwrap();
+        }
+
+        // 30-minute window: only "fresh cmd" survives.
+        let ctx = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: Some("-30 minutes".to_string()),
+        };
+        let cands = store.fetch_candidates(&ctx).unwrap();
+        assert_eq!(cands.len(), 1, "only the 20-min-old command must survive");
+        assert_eq!(cands[0].cmd_string, "fresh cmd");
+
+        // Wider 3-hour window: both survive.
+        let ctx_wide = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: Some("-3 hours".to_string()),
+        };
+        let cands = store.fetch_candidates(&ctx_wide).unwrap();
+        assert_eq!(cands.len(), 2, "both survive a 3-hour window");
+    }
 }

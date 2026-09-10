@@ -166,6 +166,37 @@ mod tests {
         assert_eq!(code, 0);
     }
 
+    /// Verify that when a high-risk command is *declined*, the
+    /// confirmation callback is invoked exactly once, the result is
+    /// strictly `Err(HsError::Cancelled)`, and **no subprocess is
+    /// spawned** (the callback return controls the branch, and `run_child`
+    /// is never reached on the `Cancelled` path).
+    #[test]
+    fn high_risk_declined_cancels_without_spawning_subprocess() {
+        let mut probe = Probe::from(false);
+        let dangerous = "dd if=/dev/sda of=/dev/null bs=1M count=1";
+
+        let result = execute_safely_with(dangerous, |cmd| {
+            probe.called_with.push(cmd.to_string());
+            probe.answer
+        });
+
+        // 1. Must return exactly HsError::Cancelled.
+        assert!(
+            matches!(result, Err(HsError::Cancelled)),
+            "declined high-risk command must yield Cancelled, got: {result:?}"
+        );
+
+        // 2. Confirmation was asked exactly once with the correct string.
+        assert_eq!(probe.called_with.len(), 1, "confirm called exactly once");
+        assert_eq!(probe.called_with[0], dangerous);
+
+        // 3. No subprocess was launched — if `run_child` had run, it would
+        //    have returned `Ok(exit_code)`, never `Err(Cancelled)`.
+        //    The `Cancelled` variant exists solely because the declined
+        //    branch never reaches `run_child`.
+    }
+
     #[test]
     fn run_child_honors_shell_environment_override() {
         use std::fs;
