@@ -286,10 +286,7 @@ mod tests {
 
     #[test]
     fn parses_time_windows_to_sqlite_modifiers() {
-        assert_eq!(
-            parse_time_window("30m"),
-            Some("-30 minutes".to_string())
-        );
+        assert_eq!(parse_time_window("30m"), Some("-30 minutes".to_string()));
         assert_eq!(parse_time_window("1h"), Some("-1 hours".to_string()));
         assert_eq!(parse_time_window("2d"), Some("-2 days".to_string()));
         assert_eq!(parse_time_window("1w"), Some("-7 days".to_string()));

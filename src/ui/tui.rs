@@ -171,8 +171,7 @@ fn render(
             ),
             Row::Command(idx) => {
                 let r = &results[*idx];
-                let in_project =
-                    current_project_id.is_some() && r.project_id == current_project_id;
+                let in_project = current_project_id.is_some() && r.project_id == current_project_id;
                 let style = if r.is_pinned {
                     Style::default()
                         .fg(Color::Yellow)

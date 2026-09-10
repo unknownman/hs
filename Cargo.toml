@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A fast, private, project-aware shell history tool"
 license = "MIT"
+repository = "https://github.com/unknownman/hs"
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled", "chrono"] }

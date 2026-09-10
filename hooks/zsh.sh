@@ -34,8 +34,8 @@ _hs_start_ms=""
 # --- Pre-exec: called right before each command runs ------------------------
 _hs_preexec() {
     local begun_cmd="$1"
-    # Never capture ourselves or other _hs helpers.
-    [[ "$begun_cmd" == _hs_* ]] && return
+    # Never capture ourselves, other _hs helpers, or direct hs invocations.
+    [[ "$begun_cmd" == _hs_* || "$begun_cmd" == "hs" || "$begun_cmd" == "hs "* ]] && return
     _hs_last_cmd="$begun_cmd"
     _hs_start_ms="$(_hs_now_ms)"
 }
@@ -51,14 +51,12 @@ _hs_precmd() {
         (( duration_ms < 0 )) && duration_ms=0
     fi
 
-    (
-        hs capture \
-            --cmd "$_hs_last_cmd" \
-            --cwd "$PWD" \
-            --exit "$exit_code" \
-            --duration-ms "$duration_ms" \
-            >/dev/null 2>&1 &
-    )
+    hs capture \
+        --cmd "$_hs_last_cmd" \
+        --cwd "$PWD" \
+        --exit "$exit_code" \
+        --duration-ms "$duration_ms" \
+        >/dev/null 2>&1 &!
 
     _hs_last_cmd=""
     _hs_start_ms=""

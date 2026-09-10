@@ -34,6 +34,8 @@ _hs_preexec() {
     local begun_cmd="$BASH_COMMAND"
     # Never capture ourselves, our proxy list assignment, or other _hs helpers.
     [[ "$begun_cmd" == _hs_* || "$begun_cmd" == PROMPT_COMMAND=* ]] && return
+    # Also skip direct hs invocations to prevent recursive capture.
+    [[ "$begun_cmd" == "hs" || "$begun_cmd" == "hs "* ]] && return
     _hs_last_cmd="$begun_cmd"
     _hs_start_ms="$(_hs_now_ms)"
 }

@@ -63,7 +63,10 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
         let rank_marker = if in_project { "→" } else { " " };
         let cells: Vec<Cell> = vec![
             Cell::new(format!("{rank_marker}{}", i + 1)),
-            Cell::new(format!("{pin_marker}{}", ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS))),
+            Cell::new(format!(
+                "{pin_marker}{}",
+                ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS)
+            )),
             Cell::new(format!("{:.2}", r.final_score)),
             Cell::new(total),
             Cell::new(success_rate),

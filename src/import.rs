@@ -82,17 +82,42 @@ fn detect_history_file() -> Option<PathBuf> {
     None
 }
 
-/// Parse bash history: one command per line, no timestamps.
+/// Parse bash history, handling optional `HISTTIMEFORMAT` markers.
+///
+/// Lines of the form `#<digits>` are treated as epoch timestamps and applied
+/// as `executed_at` to the *next* valid command line.  All other lines are
+/// emitted as commands (blanks skipped).
 fn parse_bash(contents: &str) -> Vec<ImportEntry> {
-    contents
-        .lines()
-        .map(str::trim_end)
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| ImportEntry {
+    let mut entries: Vec<ImportEntry> = Vec::new();
+    let mut pending_ts: Option<i64> = None;
+
+    for line in contents.lines().map(str::trim_end) {
+        if line.is_empty() {
+            continue;
+        }
+
+        // A `#<epoch>` timestamp marker: starts with '#', length > 1, rest is digits.
+        if let Some(rest) = line.strip_prefix('#')
+            && !rest.is_empty()
+            && rest.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(ts) = rest.parse::<i64>()
+        {
+            pending_ts = Some(ts);
+            continue;
+        }
+
+        let executed_at = pending_ts.take().and_then(|ts| {
+            use chrono::DateTime;
+            DateTime::from_timestamp(ts, 0)
+        });
+
+        entries.push(ImportEntry {
             cmd: line.to_string(),
-            executed_at: None,
-        })
-        .collect()
+            executed_at,
+        });
+    }
+
+    entries
 }
 
 /// Parse zsh extended history, joining multi-line entries.
@@ -175,6 +200,35 @@ mod tests {
         assert_eq!(entries[0].cmd, "ls");
         assert!(entries[0].executed_at.is_none());
         assert_eq!(entries[2].cmd, "cd /");
+    }
+
+    #[test]
+    fn parse_bash_with_timestamps() {
+        let contents = "\
+#1641024000
+echo hello
+#1641025000
+git status
+ls
+";
+        let entries = parse_bash(contents);
+        assert_eq!(entries.len(), 3);
+
+        assert_eq!(entries[0].cmd, "echo hello");
+        assert_eq!(
+            entries[0].executed_at.unwrap().timestamp(),
+            1641024000
+        );
+
+        assert_eq!(entries[1].cmd, "git status");
+        assert_eq!(
+            entries[1].executed_at.unwrap().timestamp(),
+            1641025000
+        );
+
+        // No timestamp after `ls` — pending_ts was consumed by `git status`.
+        assert_eq!(entries[2].cmd, "ls");
+        assert!(entries[2].executed_at.is_none());
     }
 
     #[test]
