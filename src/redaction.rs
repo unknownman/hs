@@ -13,8 +13,6 @@
 //! that prose such as `git commit -m "sk_test_is_a_file"` is *not*
 //! mangled, while genuine credentials are fully redacted.
 
-#![allow(dead_code)]
-
 use regex::Regex;
 use std::sync::OnceLock;
 

@@ -6,15 +6,13 @@
 //! executes the operation, and returns the connection — keeping
 //! latency low and pool contention minimal.
 
-#![allow(dead_code)]
-
 use chrono::{SecondsFormat, Utc};
 use rusqlite::params;
 use rusqlite::types::Value;
 
 use crate::db::DbPool;
 use crate::error::HsError;
-use crate::models::{CommandStats, ImportEntry, ImportReport, PinnedCommand, cmd_hash, dir_hash};
+use crate::models::{ImportEntry, ImportReport, PinnedCommand, cmd_hash, dir_hash};
 use crate::ranking::{RawCandidate, SearchContext};
 use crate::redaction::sanitize_command;
 
@@ -177,37 +175,6 @@ impl Store {
         let conn = self.pool.get()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM executions", [], |row| row.get(0))?;
         Ok(n)
-    }
-
-    /// Total number of unique stored commands.
-    pub fn command_count(&self) -> Result<i64, HsError> {
-        let conn = self.pool.get()?;
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))?;
-        Ok(n)
-    }
-
-    /// All stored command strings (test/doctor diagnostics).
-    pub fn command_strings(&self) -> Result<Vec<String>, HsError> {
-        let conn = self.pool.get()?;
-        let mut stmt = conn.prepare("SELECT cmd_string FROM commands WHERE project_id IS NULL")?;
-        let rows = stmt.query_map([], |row| row.get(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    /// The `executed_at` timestamp text for the first execution of
-    /// `cmd_string`, if any.
-    pub fn executed_at(&self, cmd_string: &str) -> Result<Option<String>, HsError> {
-        let conn = self.pool.get()?;
-        let ts: Option<String> = conn.query_row(
-            "SELECT e.executed_at
-             FROM executions e
-             JOIN commands c ON c.id = e.command_id
-             WHERE c.project_id IS NULL AND c.cmd_string = ?1
-             ORDER BY e.executed_at LIMIT 1",
-            params![cmd_string],
-            |row| row.get(0),
-        )?;
-        Ok(ts)
     }
 
     /// Fetch raw candidates for ranking (Phase 6 recall halving).
@@ -389,33 +356,6 @@ impl Store {
             )
             .optional()?;
         Ok(id)
-    }
-
-    /// Retrieve materialized stats for a command.
-    ///
-    /// Returns `None` if no stats exist yet (command has never been
-    /// executed through the Store).
-    pub fn get_command_stats(&self, command_id: i64) -> Result<Option<CommandStats>, HsError> {
-        let conn = self.pool.get()?;
-        let result = conn.query_row(
-            "SELECT command_id, success_count, fail_count, last_executed_at
-             FROM command_stats WHERE command_id = ?1",
-            params![command_id],
-            |row| {
-                Ok(CommandStats {
-                    command_id: row.get(0)?,
-                    success_count: row.get(1)?,
-                    fail_count: row.get(2)?,
-                    last_executed_at: row.get(3)?,
-                })
-            },
-        );
-
-        match result {
-            Ok(stats) => Ok(Some(stats)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(HsError::DatabaseError(e)),
-        }
     }
 }
 

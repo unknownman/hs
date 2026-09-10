@@ -215,16 +215,10 @@ ls
         assert_eq!(entries.len(), 3);
 
         assert_eq!(entries[0].cmd, "echo hello");
-        assert_eq!(
-            entries[0].executed_at.unwrap().timestamp(),
-            1641024000
-        );
+        assert_eq!(entries[0].executed_at.unwrap().timestamp(), 1641024000);
 
         assert_eq!(entries[1].cmd, "git status");
-        assert_eq!(
-            entries[1].executed_at.unwrap().timestamp(),
-            1641025000
-        );
+        assert_eq!(entries[1].executed_at.unwrap().timestamp(), 1641025000);
 
         // No timestamp after `ls` — pending_ts was consumed by `git status`.
         assert_eq!(entries[2].cmd, "ls");
@@ -275,11 +269,19 @@ ls
         );
         fs::write(&history_path, contents).unwrap();
 
-        let store = Store::new(test_pool());
+        let pool = test_pool();
+        let store = Store::new(pool.clone());
         let code = run_import(&store, Some(history_path.clone())).unwrap();
         assert_eq!(code, 0);
 
-        let stored = store.command_strings().unwrap();
+        let stored: Vec<String> = {
+            let conn = pool.get().unwrap();
+            let mut stmt = conn
+                .prepare("SELECT cmd_string FROM commands WHERE project_id IS NULL")
+                .unwrap();
+            let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
         assert_eq!(stored.len(), 4, "each unique entry imported");
         assert!(
             stored
@@ -291,19 +293,30 @@ ls
         assert!(stored.contains(&"git status".to_string()));
 
         // Timestamp fidelity: the first command carries its header time.
-        assert_eq!(
-            store.executed_at("echo alpha").unwrap().as_deref(),
-            Some("2020-09-13T12:26:40Z")
-        );
+        let first_ts: String = {
+            let conn = pool.get().unwrap();
+            conn.query_row(
+                "SELECT e.executed_at
+                 FROM executions e
+                 JOIN commands c ON c.id = e.command_id
+                 WHERE c.project_id IS NULL AND c.cmd_string = ?1
+                 ORDER BY e.executed_at LIMIT 1",
+                ["echo alpha"],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(first_ts, "2020-09-13T12:26:40Z");
 
         // Idempotence: re-importing the same file changes nothing.
         let second = run_import(&store, Some(history_path)).unwrap();
         assert_eq!(second, 0);
-        assert_eq!(
-            store.command_strings().unwrap().len(),
-            4,
-            "no duplicate commands after re-import"
-        );
+        let commands_after: i64 = {
+            let conn = pool.get().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM commands", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(commands_after, 4, "no duplicate commands after re-import");
         assert_eq!(
             store.execution_count().unwrap(),
             4,

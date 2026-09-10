@@ -17,8 +17,6 @@
 //! * `recency`    — freshness: what you ran recently is more relevant.
 //! * `frequency`  — log-bandwidth: heavily reused commands are trusted.
 
-#![allow(dead_code)]
-
 use chrono::{DateTime, Duration, Utc};
 use std::cmp::Ordering;
 
@@ -163,6 +161,7 @@ fn project_multiplier(c: &RawCandidate, current_project_id: Option<i64>) -> f64 
 
 /// Freshness factor based on when the command last ran.
 ///
+/// * future timestamps (clock drift / malformed import) → × 1.0 (neutral)
 /// * last 24 hours  → × 1.5
 /// * last 7 days    → × 1.2
 /// * older 90 days+ → × 0.8
@@ -173,6 +172,12 @@ fn recency_multiplier(c: &RawCandidate) -> f64 {
         return 1.0;
     };
     let age = Utc::now().signed_duration_since(last);
+    // A negative age means `last_executed_at` is in the future (clock
+    // drift or a malformed legacy-history timestamp). Treat it as
+    // unknown — never grant the `/24h` × 1.5 boost.
+    if age < Duration::zero() {
+        return 1.0;
+    }
     if age < Duration::hours(24) {
         1.5
     } else if age < Duration::days(7) {
@@ -327,6 +332,38 @@ mod tests {
         let a = score_of(&ancient, None);
         assert!((r / w - 1.25).abs() < 1e-9);
         assert!((w / a - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn future_timestamps_yield_neutral_recency_multiplier() {
+        let now = Utc::now();
+        let future = RawCandidate {
+            command_id: 1,
+            cmd_string: "clock skewed".into(),
+            // 2 days in the future → negative age; must be neutral, not × 1.5.
+            last_executed_at: Some(now + Duration::days(2)),
+            ..base_candidate()
+        };
+        let unknown = RawCandidate {
+            command_id: 2,
+            cmd_string: "no timestamp".into(),
+            last_executed_at: None,
+            ..base_candidate()
+        };
+
+        let ranked = rank_commands(vec![future.clone(), unknown.clone()], None);
+        // Identical score ⇒ the future timestamp applied a neutral 1.0
+        // recency multiplier; a ×1.5 boost would make them diverge.
+        assert!(
+            (ranked[0].final_score - ranked[1].final_score).abs() < 1e-9,
+            "future timestamp must be recency-neutral: {} vs {}",
+            ranked[0].final_score,
+            ranked[1].final_score
+        );
+        // Explicitly equal to the no-recency baseline.
+        assert!(
+            (ranked[0].final_score - score_of(&unknown, None)).abs() < 1e-9
+        );
     }
 
     #[test]

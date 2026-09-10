@@ -1,16 +1,13 @@
 //! Context Engine — understands *where* commands run and *how dangerous*
 //! they are.
 //!
-//! Three responsibilities:
+//! Two responsibilities:
 //!
 //! 1. **Project detection** — locate the nearest `.git` boundary.
-//! 2. **Stack detection** — infer the tech stack from indicator files.
-//! 3. **Risk classification** — flag obviously destructive commands.
+//! 2. **Risk classification** — flag obviously destructive commands.
 //!
 //! All functions are pure and take raw inputs, returning enriched
 //! results.  Nothing here touches the database or the shell.
-
-#![allow(dead_code)]
 
 use regex::Regex;
 use std::path::{Path, PathBuf};
@@ -30,43 +27,6 @@ pub fn find_project_root(current_dir: &Path) -> Option<PathBuf> {
         .ancestors()
         .find(|dir| dir.join(".git").exists())
         .map(Path::to_path_buf)
-}
-
-// ────────────────────────────────────────────────────────────────────────
-// Stack detection
-// ────────────────────────────────────────────────────────────────────────
-
-/// Detect the tech stack of a project from indicator files.
-///
-/// Returns a deterministic, de-duplicated list of tags in a fixed order.
-/// The presence of a marker file maps to a tag:
-///
-/// | File | Tag |
-/// |------|-----|
-/// | `Cargo.toml` | `rust` |
-/// | `package.json` | `node` |
-/// | `Dockerfile` | `docker` |
-/// | `pyproject.toml` | `python` |
-/// | `requirements.txt` | `python` |
-/// | `go.mod` | `go` |
-pub fn detect_stacks(project_root: &Path) -> Vec<String> {
-    // (indicator file, tag) — ordered so results are deterministic.
-    const CHECKS: &[(&str, &str)] = &[
-        ("Cargo.toml", "rust"),
-        ("package.json", "node"),
-        ("Dockerfile", "docker"),
-        ("pyproject.toml", "python"),
-        ("requirements.txt", "python"),
-        ("go.mod", "go"),
-    ];
-
-    let mut stacks: Vec<String> = Vec::new();
-    for (file, tag) in CHECKS {
-        if project_root.join(file).exists() && !stacks.contains(&(*tag).to_string()) {
-            stacks.push((*tag).to_string());
-        }
-    }
-    stacks
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -173,50 +133,6 @@ mod tests {
         std::fs::create_dir_all(inner.join(".git")).unwrap();
 
         assert_eq!(find_project_root(&inner), Some(inner.to_path_buf()));
-    }
-
-    // ── detect_stacks ────────────────────────────────────────────────
-
-    #[test]
-    fn detects_known_marker_files() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-
-        std::fs::write(root.join("Cargo.toml"), "").unwrap();
-        std::fs::write(root.join("package.json"), "{}").unwrap();
-        std::fs::write(root.join("Dockerfile"), "").unwrap();
-        std::fs::write(root.join("pyproject.toml"), "").unwrap();
-
-        let stacks = detect_stacks(root);
-        assert_eq!(stacks, vec!["rust", "node", "docker", "python"]);
-    }
-
-    #[test]
-    fn python_markers_are_deduplicated() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-
-        std::fs::write(root.join("pyproject.toml"), "").unwrap();
-        std::fs::write(root.join("requirements.txt"), "").unwrap();
-
-        let stacks = detect_stacks(root);
-        assert_eq!(stacks, vec!["python"]);
-    }
-
-    #[test]
-    fn detects_go_project() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
-
-        std::fs::write(root.join("go.mod"), "").unwrap();
-
-        assert_eq!(detect_stacks(root), vec!["go"]);
-    }
-
-    #[test]
-    fn empty_for_unknown_project() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(detect_stacks(tmp.path()).is_empty());
     }
 
     // ── analyze_risk ─────────────────────────────────────────────────
