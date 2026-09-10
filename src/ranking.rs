@@ -39,8 +39,11 @@ pub struct SearchContext {
     pub ok_only: bool,
     /// Only commands that have failed at least once (maps to `--failed`).
     pub failed_only: bool,
-    /// Only commands executed within the last `N` days (maps to `--last`).
-    pub time_window_days: Option<i64>,
+    /// Only commands executed since `now` minus this SQLite relative-time
+    /// modifier (maps to `--last`). Examples: `"-30 minutes"`,
+    /// `"-1 hours"`, `"-2 days"`. Passed as a *parameterized* value
+    /// (never interpolated) to prevent SQL injection.
+    pub time_window: Option<String>,
 }
 
 /// A single row returned by [`crate::db::repository::Store::fetch_candidates`].
@@ -60,6 +63,8 @@ pub struct RawCandidate {
     pub last_executed_at: Option<DateTime<Utc>>,
     /// Raw FTS5 `bm25` score (`1.0` sentinel when no query was used).
     pub bm25: f64,
+    /// Whether this command is pinned by the user.
+    pub is_pinned: bool,
 }
 
 /// A candidate after final scoring, ready for the UI.
@@ -80,6 +85,8 @@ pub struct RankedCommand {
     pub fail_count: i64,
     /// When the command was last executed (RFC 3339).
     pub last_executed_at: Option<String>,
+    /// Whether this command is pinned by the user.
+    pub is_pinned: bool,
 }
 
 /// Rank raw candidates into a final descending-sorted list.
@@ -100,6 +107,7 @@ pub fn rank_commands(
             success_count: c.success_count,
             fail_count: c.fail_count,
             last_executed_at: c.last_executed_at.map(|dt| dt.to_rfc3339()),
+            is_pinned: c.is_pinned,
         })
         .collect();
 
@@ -188,6 +196,12 @@ fn frequency_multiplier(c: &RawCandidate) -> f64 {
     }
 }
 
+/// Pin factor: pinned commands are boosted × 100 so they always surface
+/// to the top of results, regardless of other scoring factors.
+fn pin_multiplier(c: &RawCandidate) -> f64 {
+    if c.is_pinned { 100.0 } else { 1.0 }
+}
+
 /// The full multiplicative score for one candidate.
 fn score(c: &RawCandidate, current_project_id: Option<i64>) -> f64 {
     base_score(c.bm25)
@@ -195,6 +209,7 @@ fn score(c: &RawCandidate, current_project_id: Option<i64>) -> f64 {
         * project_multiplier(c, current_project_id)
         * recency_multiplier(c)
         * frequency_multiplier(c)
+        * pin_multiplier(c)
 }
 
 #[cfg(test)]
@@ -213,6 +228,7 @@ mod tests {
             fail_count: 0,
             last_executed_at: Some(Utc::now()),
             bm25: -1.0,
+            is_pinned: false,
         }
     }
 
@@ -243,6 +259,7 @@ mod tests {
             fail_count: 1, // rate ≈ 0.98 > 0.8
             last_executed_at: Some(now),
             bm25: -1.0,
+            is_pinned: false,
         };
         let unreliable = RawCandidate {
             command_id: 2,
@@ -252,6 +269,7 @@ mod tests {
             fail_count: 9, // rate = 0.1 < 0.5
             last_executed_at: Some(now),
             bm25: -1.0,
+            is_pinned: false,
         };
 
         let a = score_of(&reliable, None);
@@ -371,5 +389,60 @@ mod tests {
         };
         let ranked = rank_commands(vec![one, two], None);
         assert_eq!(ranked.len(), 2);
+    }
+
+    #[test]
+    fn pinned_command_with_zero_runs_outranks_unpinned_with_fifty_runs() {
+        let now = Utc::now();
+        let pinned = RawCandidate {
+            command_id: 1,
+            cmd_string: "pinned cmd".into(),
+            success_count: 0,
+            fail_count: 0,
+            last_executed_at: Some(now),
+            bm25: -1.0,
+            is_pinned: true,
+            ..base_candidate()
+        };
+        let unpinned = RawCandidate {
+            command_id: 2,
+            cmd_string: "popular unpinned cmd".into(),
+            success_count: 50,
+            fail_count: 0,
+            last_executed_at: Some(now),
+            bm25: -1.0,
+            is_pinned: false,
+            ..base_candidate()
+        };
+
+        let ranked = rank_commands(vec![unpinned.clone(), pinned.clone()], None);
+        assert_eq!(ranked[0].command_id, 1, "pinned must be first");
+        assert!(ranked[0].is_pinned);
+        // Pin boost ×100 overwhelms the frequency boost from 50 runs.
+        assert!(
+            ranked[0].final_score > ranked[1].final_score,
+            "pinned (0 runs) must outrank unpinned (50 runs): {} vs {}",
+            ranked[0].final_score,
+            ranked[1].final_score
+        );
+    }
+
+    #[test]
+    fn pin_boost_is_exactly_100x() {
+        let now = Utc::now();
+        let base = RawCandidate {
+            last_executed_at: Some(now),
+            ..base_candidate()
+        };
+        let mut pinned = base.clone();
+        pinned.is_pinned = true;
+        let mut unpinned = base;
+        unpinned.command_id = 2;
+
+        let ratio = score_of(&pinned, None) / score_of(&unpinned, None);
+        assert!(
+            (ratio - 100.0).abs() < 1e-9,
+            "pin boost must be exactly 100x, got {ratio}"
+        );
     }
 }

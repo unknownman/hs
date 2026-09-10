@@ -80,11 +80,15 @@ pub struct CommandStats {
     pub last_executed_at: Option<DateTime<Utc>>,
 }
 
-/// A user-pinned command that resists rank decay.
+/// A user-pinned command, resolved with enough context to render.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Pin {
+pub struct PinnedCommand {
     /// FK → `commands.id`.
     pub command_id: i64,
+    /// The literal command string (post-redaction).
+    pub cmd_string: String,
+    /// Absolute path of the owning project, `None` for non-project commands.
+    pub project_path: Option<String>,
     /// UTC timestamp when the pin was created.
     pub pinned_at: DateTime<Utc>,
 }

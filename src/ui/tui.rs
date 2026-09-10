@@ -170,9 +170,14 @@ fn render(
                     .add_modifier(Modifier::BOLD),
             ),
             Row::Command(idx) => {
+                let r = &results[*idx];
                 let in_project =
-                    current_project_id.is_some() && results[*idx].project_id == current_project_id;
-                let style = if in_project {
+                    current_project_id.is_some() && r.project_id == current_project_id;
+                let style = if r.is_pinned {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if in_project {
                     Style::default()
                         .fg(Color::Green)
                         .add_modifier(Modifier::BOLD)
@@ -181,8 +186,14 @@ fn render(
                 };
                 // One-line list cell: truncate pathological commands to a
                 // safe display width. The preview panel below shows the
-                // full text (wrapped).
-                ListItem::new(ellipsize(&results[*idx].cmd_string, MAX_DISPLAY_CHARS)).style(style)
+                // full text (wrapped). Pinned commands are prefixed with
+                // a pin glyph so they stand out from the crowd.
+                let label = if r.is_pinned {
+                    format!("📌 {}", ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS))
+                } else {
+                    ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS)
+                };
+                ListItem::new(label).style(style)
             }
         })
         .collect();
@@ -226,7 +237,8 @@ fn render(
 
             let lines = vec![
                 ratatui::text::Line::from(format!(
-                    "Score {:.2}  ·  {} run(s)  ·  success rate {}  ·  last: {}",
+                    "{}Score {:.2}  ·  {} run(s)  ·  success rate {}  ·  last: {}",
+                    if r.is_pinned { " 📌 PINNED  " } else { "" },
                     r.final_score,
                     total,
                     rate,
@@ -269,6 +281,7 @@ mod tests {
             success_count: 3,
             fail_count: 0,
             last_executed_at: Some("2026-09-08T10:11:12Z".to_string()),
+            is_pinned: false,
         }
     }
 
@@ -352,6 +365,36 @@ mod tests {
             "section header must render"
         );
         assert!(text.contains("Preview"), "preview panel must render");
+    }
+
+    #[test]
+    fn renders_pinned_marker_in_list_and_preview() {
+        use ratatui::backend::TestBackend;
+
+        let mut pinned = sample("cargo deploy --prod", Some(3));
+        pinned.is_pinned = true;
+        let results = vec![pinned, sample("echo hello", None)];
+        let rows = build_rows(&results, Some(3));
+        let mut state = ListState::default();
+        state.select(Some(1)); // first command row
+
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &results, Some(3), &rows, &mut state))
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        // Both the list cell and the preview header flag the pin.
+        assert!(
+            text.contains("PINNED"),
+            "preview must show the PINNED badge, got: {text:?}"
+        );
     }
 
     /// Phase 8 hardening: a 5,000-character multiline command must render

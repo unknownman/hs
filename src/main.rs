@@ -52,15 +52,15 @@ fn run(cli: Cli) -> Result<i32, HsError> {
         // ── Subcommands that need the database ──────────────────────
         Some(Commands::Pin { id }) => {
             let pool = get_pool()?;
-            cmd_pin(&pool, id);
+            return cmd_pin(&pool, id);
         }
         Some(Commands::Unpin { id }) => {
             let pool = get_pool()?;
-            cmd_unpin(&pool, id);
+            return cmd_unpin(&pool, id);
         }
         Some(Commands::Pins) => {
             let pool = get_pool()?;
-            cmd_pins(&pool);
+            return cmd_pins(&pool);
         }
         Some(Commands::Import { path }) => {
             let pool = get_pool()?;
@@ -91,13 +91,15 @@ fn run(cli: Cli) -> Result<i32, HsError> {
 
 /// Search → rank → display → (optionally) safely execute.
 ///
+/// Searching NEVER executes a command. Only an explicit `Enter` in the
+/// interactive TUI hands the command to the execution guard.
+///
 /// Branching:
 /// * zero results → quiet message, exit 0.
-/// * `--print` or non-TTY stdout → table, exit 0.
-/// * strict query with exactly one exact match → execute immediately
-///   (guarded).
-/// * otherwise → interactive TUI; `Enter` runs the selected command
-///   (guarded), `Esc`/`Ctrl-C` exits without running.
+/// * `hs <query>` (any query), `--print`, or non-TTY stdout → ranked
+///   table, exit 0.
+/// * `hs` with no query on a TTY → interactive TUI; `Enter` runs the
+///   selected command (guarded), `Esc`/`Ctrl-C` exits without running.
 fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
     let pool = get_pool()?;
     let store = db::repository::Store::new(pool);
@@ -118,7 +120,7 @@ fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
         global: !cli.project,
         ok_only: cli.ok,
         failed_only: cli.failed,
-        time_window_days: cli.last.as_deref().and_then(parse_time_window),
+        time_window: cli.last.as_deref().and_then(parse_time_window),
     };
 
     let candidates = store.fetch_candidates(&ctx)?;
@@ -132,48 +134,49 @@ fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
         return Ok(0);
     }
 
-    // A strict, exact single match is an implicit "do it again".
-    let exact_match = query.is_some()
-        && ranked.len() == 1
-        && ranked[0].cmd_string == query.as_deref().unwrap_or_default();
-
-    let interactive = !cli.print && std::io::stdout().is_terminal();
-
-    if exact_match {
-        let cmd = ranked[0].cmd_string.clone();
-        return guard::execute_safely(&cmd);
-    }
-
-    if !interactive {
+    if !should_launch_tui(
+        cli.query.is_some(),
+        cli.print,
+        std::io::stdout().is_terminal(),
+    ) {
         ui::format::print_results_table(&ranked, current_project_id);
         return Ok(0);
     }
 
-    match ui::tui::run(&ranked, current_project_id)? {
-        Some(cmd) => guard::execute_safely(&cmd),
-        None => Ok(0),
-    }
+    ui::tui::run(&ranked, current_project_id)?.map_or(Ok(0), |cmd| guard::execute_safely(&cmd))
 }
 
-/// Parse a `--last` window like `30m`, `1h`, `2d`, `1w` into whole days.
+/// Decide whether to launch the interactive TUI or print a table.
 ///
-/// The ranking filter is day-granularized, so sub-day windows floor to
-/// 1 day and hour windows round up (`1h` → 1, `30m` → 1, `2d` → 2,
-/// `1w` → 7).
-fn parse_time_window(spec: &str) -> Option<i64> {
+/// The TUI is the *only* surface that can run a command (via explicit
+/// `Enter`), and it only makes sense as the default action with no
+/// query on a real terminal.
+fn should_launch_tui(query_present: bool, print: bool, is_terminal: bool) -> bool {
+    !query_present && !print && is_terminal
+}
+
+/// Parse a `--last` window like `30m`, `1h`, `2d`, `1w` into a SQLite
+/// relative-time modifier string.
+///
+/// SQLite's `date`/`strftime` modifiers accept exact sub-day precision
+/// (`'-30 minutes'`, `'-1 hours'`), so sub-day windows no longer round
+/// up to a whole day. Only integers are accepted as input and the output
+/// is fully deterministic — the returned string is always bound as a
+/// **parameterized value** by the query builder (never interpolated into
+/// SQL), so malformed input is rejected here before it can even reach
+/// the database.
+fn parse_time_window(spec: &str) -> Option<String> {
     let spec = spec.trim();
     let (num, unit) = spec.split_at(spec.len().saturating_sub(1));
     let n: i64 = num.parse().ok()?;
-    match unit {
-        "m" => Some(1),
-        "h" => {
-            let days = n / 24;
-            Some(if n % 24 == 0 { days } else { days + 1 }.max(1))
-        }
-        "d" => Some(n.max(1)),
-        "w" => Some((n * 7).max(1)),
-        _ => None,
-    }
+    let modifier = match unit {
+        "m" => format!("-{n} minutes"),
+        "h" => format!("-{n} hours"),
+        "d" => format!("-{n} days"),
+        "w" => format!("-{} days", n * 7),
+        _ => return None,
+    };
+    Some(modifier)
 }
 
 /// Resolve the database pool, initialising the DB on first use.
@@ -192,22 +195,28 @@ fn default_db_path() -> Result<PathBuf, HsError> {
 
 // ── Subcommand handlers ────────────────────────────────────────────────────
 
-/// Pin a command by ID.
-fn cmd_pin(pool: &DbPool, id: i64) {
-    let _ = pool;
-    println!("Route: Pin | ID: {id}");
+/// Pin a command by ID, so it surfaces in `hs pins`.
+fn cmd_pin(pool: &DbPool, id: i64) -> Result<i32, HsError> {
+    let store = db::repository::Store::new(pool.clone());
+    store.pin_command(id)?;
+    println!("[hs] Pinned command #{id}");
+    Ok(0)
 }
 
-/// Unpin a command by ID.
-fn cmd_unpin(pool: &DbPool, id: i64) {
-    let _ = pool;
-    println!("Route: Unpin | ID: {id}");
+/// Unpin a command by ID. No-op (but still an exit 0) if not pinned.
+fn cmd_unpin(pool: &DbPool, id: i64) -> Result<i32, HsError> {
+    let store = db::repository::Store::new(pool.clone());
+    store.unpin_command(id)?;
+    println!("[hs] Unpinned command #{id}");
+    Ok(0)
 }
 
-/// List all pinned commands.
-fn cmd_pins(pool: &DbPool) {
-    let _ = pool;
-    println!("Route: Pins");
+/// List every pinned command as a table (or a quiet empty message).
+fn cmd_pins(pool: &DbPool) -> Result<i32, HsError> {
+    let store = db::repository::Store::new(pool.clone());
+    let pins = store.list_pins()?;
+    ui::format::print_pins_table(&pins);
+    Ok(0)
 }
 
 /// Import standard shell history (auto-detected or explicit path).
@@ -254,14 +263,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_time_windows_to_days() {
-        assert_eq!(parse_time_window("30m"), Some(1));
-        assert_eq!(parse_time_window("1h"), Some(1));
-        assert_eq!(parse_time_window("25h"), Some(2));
-        assert_eq!(parse_time_window("2d"), Some(2));
-        assert_eq!(parse_time_window("1w"), Some(7));
+    fn should_launch_tui_only_without_query_or_print_on_a_terminal() {
+        // `hs` on a TTY → TUI. Every other combination → table.
+        assert!(should_launch_tui(false, false, true));
+        assert!(
+            !should_launch_tui(true, false, true),
+            "query forces a table"
+        );
+        assert!(
+            !should_launch_tui(false, true, true),
+            "--print forces a table"
+        );
+        assert!(
+            !should_launch_tui(false, false, false),
+            "pipe forces a table"
+        );
+        assert!(!should_launch_tui(true, true, true));
+        assert!(!should_launch_tui(true, false, false));
+        assert!(!should_launch_tui(false, true, false));
+        assert!(!should_launch_tui(true, true, false));
+    }
+
+    #[test]
+    fn parses_time_windows_to_sqlite_modifiers() {
+        assert_eq!(
+            parse_time_window("30m"),
+            Some("-30 minutes".to_string())
+        );
+        assert_eq!(parse_time_window("1h"), Some("-1 hours".to_string()));
+        assert_eq!(parse_time_window("2d"), Some("-2 days".to_string()));
+        assert_eq!(parse_time_window("1w"), Some("-7 days".to_string()));
+        assert_eq!(parse_time_window("0m"), Some("-0 minutes".to_string()));
         assert_eq!(parse_time_window("0"), None);
         assert_eq!(parse_time_window("garbage"), None);
+        assert_eq!(parse_time_window(""), None);
     }
 
     #[test]

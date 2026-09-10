@@ -14,7 +14,7 @@ use rusqlite::types::Value;
 
 use crate::db::DbPool;
 use crate::error::HsError;
-use crate::models::{CommandStats, ImportEntry, ImportReport, cmd_hash, dir_hash};
+use crate::models::{CommandStats, ImportEntry, ImportReport, PinnedCommand, cmd_hash, dir_hash};
 use crate::ranking::{RawCandidate, SearchContext};
 use crate::redaction::sanitize_command;
 
@@ -236,10 +236,12 @@ impl Store {
 
         if let Some(query) = ctx.query.as_deref() {
             sql.push_str(
-                " bm25(commands_fts) AS bm
+                " bm25(commands_fts) AS bm,
+                p.command_id IS NOT NULL AS is_pinned
                 FROM commands c
                 INNER JOIN commands_fts ON commands_fts.rowid = c.id
-                LEFT JOIN command_stats s ON s.command_id = c.id",
+                LEFT JOIN command_stats s ON s.command_id = c.id
+                LEFT JOIN pins p ON p.command_id = c.id",
             );
             match sanitize_fts_query(query) {
                 Some(q) => {
@@ -252,9 +254,11 @@ impl Store {
             }
         } else {
             sql.push_str(
-                " 1.0 AS bm
+                " 1.0 AS bm,
+                p.command_id IS NOT NULL AS is_pinned
                 FROM commands c
-                LEFT JOIN command_stats s ON s.command_id = c.id",
+                LEFT JOIN command_stats s ON s.command_id = c.id
+                LEFT JOIN pins p ON p.command_id = c.id",
             );
         }
 
@@ -274,12 +278,14 @@ impl Store {
             wheres.push("s.fail_count > 0".to_string());
         }
 
-        // Recency filter.  Mirrors the storage format exactly so text
-        // comparison is lexically ordered.
-        if let Some(days) = ctx.time_window_days {
+        // Recency filter. The modifier string is *parameterized* (bound
+        // via `?`) so it is never interpolated into SQL — safe against
+        // injection. `parse_time_window` only produces deterministic
+        // strings from parsed integers, never raw user input.
+        if let Some(ref modifier) = ctx.time_window {
             wheres
                 .push("s.last_executed_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)".to_string());
-            values.push(Value::Text(format!("-{days} days")));
+            values.push(Value::Text(modifier.clone()));
         }
 
         if !wheres.is_empty() {
@@ -303,13 +309,18 @@ impl Store {
                 fail_count: row.get(4)?,
                 last_executed_at,
                 bm25: row.get(6)?,
+                is_pinned: row.get::<_, bool>(7)?,
             })
         })?;
 
         rows.collect::<Result<Vec<_>, _>>().map_err(HsError::from)
     }
 
-    /// Pin a command so it resists rank decay in search results.
+    /// Pin a command so it can be recalled later.
+    ///
+    /// Pinning is idempotent: re-pinning an already-pinned command is a
+    /// no-op (the `pins` table uses the command id as its primary key).
+    /// Pinning a command id that does not exist fails via the foreign key.
     pub fn pin_command(&self, command_id: i64) -> Result<(), HsError> {
         let conn = self.pool.get()?;
         conn.execute(
@@ -317,6 +328,49 @@ impl Store {
             params![command_id],
         )?;
         Ok(())
+    }
+
+    /// Remove a pin from a previously pinned command.
+    ///
+    /// Unpinning an id that is not pinned is a no-op, so this can be
+    /// called defensively without pre-checks.
+    pub fn unpin_command(&self, command_id: i64) -> Result<(), HsError> {
+        let conn = self.pool.get()?;
+        conn.execute(
+            "DELETE FROM pins WHERE command_id = ?1",
+            params![command_id],
+        )?;
+        Ok(())
+    }
+
+    /// List every pinned command, newest pin first.
+    ///
+    /// Joins the pinned command's string and (when present) its project
+    /// root path. Project-less commands yield `project_path = None`. If a
+    /// command is deleted, its pin is removed by the `ON DELETE CASCADE`
+    /// foreign key, so it can never dangle here.
+    pub fn list_pins(&self) -> Result<Vec<PinnedCommand>, HsError> {
+        let conn = self.pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT c.id, c.cmd_string, p.path, pins.pinned_at
+             FROM pins
+             JOIN commands c ON c.id = pins.command_id
+             LEFT JOIN projects p ON p.id = c.project_id
+             ORDER BY pins.pinned_at DESC, c.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let pinned_raw: String = row.get(3)?;
+            let pinned_at = chrono::DateTime::parse_from_rfc3339(&pinned_raw)
+                .map(|dt| dt.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now());
+            Ok(PinnedCommand {
+                command_id: row.get(0)?,
+                cmd_string: row.get(1)?,
+                project_path: row.get(2)?,
+                pinned_at,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(HsError::from)
     }
 
     /// Resolve the internal project id for a project root path.
@@ -335,16 +389,6 @@ impl Store {
             )
             .optional()?;
         Ok(id)
-    }
-
-    /// Remove a pin from a previously pinned command.
-    pub fn unpin_command(&self, command_id: i64) -> Result<(), HsError> {
-        let conn = self.pool.get()?;
-        conn.execute(
-            "DELETE FROM pins WHERE command_id = ?1",
-            params![command_id],
-        )?;
-        Ok(())
     }
 
     /// Retrieve materialized stats for a command.
@@ -658,6 +702,132 @@ mod tests {
     }
 
     #[test]
+    fn pin_missing_command_errors() {
+        let store = test_store();
+        let result = store.pin_command(999999);
+        assert!(result.is_err(), "pinning a nonexistent command must fail");
+    }
+
+    #[test]
+    fn pin_is_idempotent() {
+        let store = test_store();
+        store
+            .insert_execution(None, "cargo test", 0, 1000, "/proj")
+            .unwrap();
+        let id = command_id(&store, "cargo test", None);
+
+        store.pin_command(id).unwrap();
+        store.pin_command(id).unwrap();
+        store.pin_command(id).unwrap();
+
+        let conn = store.pool.get().unwrap();
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM pins", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "re-pinning must not duplicate the pin");
+    }
+
+    #[test]
+    fn unpin_is_idempotent() {
+        let store = test_store();
+        store
+            .insert_execution(Some("/proj"), "ls -la", 0, 10, "/proj")
+            .unwrap();
+        let id = command_id(&store, "ls -la", Some("/proj"));
+
+        store.unpin_command(id).unwrap();
+        store.unpin_command(id).unwrap();
+
+        let conn = store.pool.get().unwrap();
+        let count: i32 = conn
+            .query_row("SELECT COUNT(*) FROM pins", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn list_pins_resolves_command_and_project_context() {
+        let store = test_store();
+        store
+            .insert_execution(Some("/project-a"), "make build", 0, 100, "/project-a/src")
+            .unwrap();
+        store
+            .insert_execution(None, "echo standalone", 0, 5, "/tmp")
+            .unwrap();
+
+        let proj_id = command_id(&store, "make build", Some("/project-a"));
+        let bare_id = command_id(&store, "echo standalone", None);
+
+        store.pin_command(proj_id).unwrap();
+        store.pin_command(bare_id).unwrap();
+
+        let pins = store.list_pins().unwrap();
+
+        // Project-attributed pin carries its project path; the bare one is None.
+        let proj_pin = pins.iter().find(|p| p.command_id == proj_id).unwrap();
+        assert_eq!(proj_pin.cmd_string, "make build");
+        assert_eq!(proj_pin.project_path.as_deref(), Some("/project-a"));
+        assert!(proj_pin.pinned_at <= chrono::Utc::now());
+
+        let bare_pin = pins.iter().find(|p| p.command_id == bare_id).unwrap();
+        assert_eq!(bare_pin.cmd_string, "echo standalone");
+        assert_eq!(bare_pin.project_path, None);
+    }
+
+    #[test]
+    fn list_pins_orders_newest_first() {
+        let store = test_store();
+        store
+            .insert_execution(Some("/older"), "old command", 0, 10, "/older")
+            .unwrap();
+        store
+            .insert_execution(Some("/newer"), "new command", 0, 10, "/newer")
+            .unwrap();
+        let old_id = command_id(&store, "old command", Some("/older"));
+        let new_id = command_id(&store, "new command", Some("/newer"));
+
+        store.pin_command(old_id).unwrap();
+        store.pin_command(new_id).unwrap();
+
+        // Backdate the old pin so the ordering assertion is deterministic
+        // even though both were inserted within the same UTC second.
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "UPDATE pins SET pinned_at = '2020-01-01T00:00:00Z' WHERE command_id = ?1",
+                params![old_id],
+            )
+            .unwrap();
+        }
+
+        let pins = store.list_pins().unwrap();
+        assert_eq!(pins.len(), 2);
+        assert_eq!(
+            pins[0].command_id, new_id,
+            "newest pin must be listed first"
+        );
+        assert_eq!(pins[1].command_id, old_id);
+    }
+
+    #[test]
+    fn deleting_command_cascades_away_its_pin() {
+        let store = test_store();
+        store
+            .insert_execution(None, "ephemeral", 0, 10, "/tmp")
+            .unwrap();
+        let id = command_id(&store, "ephemeral", None);
+        store.pin_command(id).unwrap();
+
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute("DELETE FROM commands WHERE id = ?1", params![id])
+                .unwrap();
+        }
+
+        assert!(store.list_pins().unwrap().is_empty());
+    }
+
+    #[test]
     fn non_project_command_stored_with_null_project() {
         let store = test_store();
 
@@ -708,7 +878,7 @@ mod tests {
             global: true,
             ok_only: false,
             failed_only: false,
-            time_window_days: None,
+            time_window: None,
         };
 
         let candidates = store.fetch_candidates(&ctx).unwrap();
@@ -767,7 +937,7 @@ mod tests {
             global: true,
             ok_only: false,
             failed_only: false,
-            time_window_days: None,
+            time_window: None,
         };
 
         let candidates = store.fetch_candidates(&ctx).unwrap();
@@ -837,7 +1007,7 @@ mod tests {
             global: true,
             ok_only: false,
             failed_only: false,
-            time_window_days: None,
+            time_window: None,
         };
 
         let candidates = store.fetch_candidates(&ctx).unwrap();
@@ -876,7 +1046,7 @@ mod tests {
             global: true,
             ok_only: false,
             failed_only: false,
-            time_window_days: None,
+            time_window: None,
         };
 
         let candidates = store.fetch_candidates(&ctx).unwrap();
@@ -917,7 +1087,7 @@ mod tests {
             global: true,
             ok_only: false,
             failed_only: false,
-            time_window_days: None,
+            time_window: None,
         };
 
         let candidates = store.fetch_candidates(&ctx).unwrap();
@@ -969,7 +1139,7 @@ mod tests {
             global: true,
             ok_only: false,
             failed_only: false,
-            time_window_days: None,
+            time_window: None,
         };
         let candidates = store.fetch_candidates(&ctx).unwrap();
         assert!(candidates.is_empty(), "no tokens → no candidates, no crash");
@@ -1083,7 +1253,7 @@ mod tests {
             global: true,
             ok_only: true,
             failed_only: false,
-            time_window_days: None,
+            time_window: None,
         };
         let ok = store.fetch_candidates(&ok_ctx).unwrap();
         assert_eq!(ok.len(), 1);
@@ -1095,7 +1265,7 @@ mod tests {
             global: true,
             ok_only: false,
             failed_only: true,
-            time_window_days: None,
+            time_window: None,
         };
         let failed = store.fetch_candidates(&failed_ctx).unwrap();
         assert_eq!(failed.len(), 1);
@@ -1141,7 +1311,7 @@ mod tests {
             global: false,
             ok_only: false,
             failed_only: false,
-            time_window_days: None,
+            time_window: None,
         };
         let scoped_cands = store.fetch_candidates(&scoped).unwrap();
         assert_eq!(scoped_cands.len(), 2, "only project B commands");
@@ -1153,10 +1323,122 @@ mod tests {
             global: false,
             ok_only: false,
             failed_only: false,
-            time_window_days: Some(3),
+            time_window: Some("-3 days".to_string()),
         };
         let windowed_cands = store.fetch_candidates(&windowed).unwrap();
         assert_eq!(windowed_cands.len(), 1, "window prunes stale command");
         assert_eq!(windowed_cands[0].cmd_string, "from b");
+    }
+
+    /// Acceptance: sub-day precision. A command run 45 minutes ago is
+    /// excluded by `--last 30m` (modifier `-30 minutes`) but included by
+    /// `--last 1h` (modifier `-1 hours`).
+    #[test]
+    fn sub_day_time_window_prunes_and_includes_precisely() {
+        let store = test_store();
+
+        // Insert a command, then backdate its stats to 45 minutes ago.
+        store
+            .insert_execution(Some("/proj"), "mid recency probe", 0, 10, "/proj")
+            .unwrap();
+        let id = command_id(&store, "mid recency probe", Some("/proj"));
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "UPDATE command_stats SET last_executed_at =
+                     strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-45 minutes') WHERE command_id = ?1",
+                [id],
+            )
+            .unwrap();
+        }
+
+        // 30-minute window must EXCLUDE a 45-minute-old command.
+        let short = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: Some("-30 minutes".to_string()),
+        };
+        let short_cands = store.fetch_candidates(&short).unwrap();
+        assert!(
+            short_cands.is_empty(),
+            "-30 minutes must exclude a 45-minute-old command"
+        );
+
+        // 1-hour window must INCLUDE a 45-minute-old command.
+        let hour = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: Some("-1 hours".to_string()),
+        };
+        let hour_cands = store.fetch_candidates(&hour).unwrap();
+        assert_eq!(hour_cands.len(), 1, "-1 hours must include it");
+        assert_eq!(hour_cands[0].cmd_string, "mid recency probe");
+    }
+
+    /// Acceptance: a pinned command with 0 historical runs outranks an
+    /// unpinned command with 50 runs. Proves the pin boost is applied
+    /// end-to-end (through fetch → rank).
+    #[test]
+    fn pinned_tracks_surface_through_fetch_and_rank() {
+        let store = test_store();
+
+        // One command with 50 successful runs, one with zero runs.
+        for _ in 0..50 {
+            store
+                .insert_execution(Some("/proj"), "popular command", 0, 10, "/proj")
+                .unwrap();
+        }
+        store
+            .insert_execution(Some("/proj"), "pinned alone", 0, 10, "/proj")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "pinned alone", 1, 10, "/proj")
+            .unwrap();
+
+        let popular_id = command_id(&store, "popular command", Some("/proj"));
+        let pinned_id = command_id(&store, "pinned alone", Some("/proj"));
+
+        // Pin the second (recent, but 1 run / 1 failure).
+        store.pin_command(pinned_id).unwrap();
+
+        let ctx = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: None,
+        };
+
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        assert_eq!(candidates.len(), 2);
+        let pinned_candidate = candidates
+            .iter()
+            .find(|c| c.command_id == pinned_id)
+            .expect("pinned command must be fetched");
+        assert!(
+            pinned_candidate.is_pinned,
+            "fetch_candidates must mark the pinned row"
+        );
+        let popular_candidate = candidates
+            .iter()
+            .find(|c| c.command_id == popular_id)
+            .unwrap();
+        assert!(
+            !popular_candidate.is_pinned,
+            "unpinned row must not be flagged"
+        );
+
+        let ranked = rank_commands(candidates, None);
+        assert_eq!(ranked[0].command_id, pinned_id, "pinned must rank first");
+        assert!(ranked[0].is_pinned);
+        assert_eq!(ranked[1].command_id, popular_id);
+        assert!(!ranked[1].is_pinned);
     }
 }

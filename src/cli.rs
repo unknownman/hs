@@ -3,7 +3,7 @@
 //! All argument parsing and help-text generation lives here.
 //! The routing logic that dispatches to subsystems lives in [`crate::main`].
 
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 /// `hs` — What worked here before?
@@ -29,10 +29,6 @@ use std::path::PathBuf;
 ///
 ///     hs --global --last 1w docker build
 ///
-/// Search with multiple tech-stack filters:
-///
-///     hs -t cargo -t docker build
-///
 /// Launch the interactive TUI:
 ///
 ///     hs
@@ -51,7 +47,7 @@ use std::path::PathBuf;
         # Quick start\n\
         hs --project --ok deploy       # successful deploy commands in this project\n\
         hs --last 2d docker            # docker commands from the last 2 days\n\
-        hs -t cargo -t docker build    # build commands tagged with cargo or docker"
+        hs --ok build                  # successful build commands"
 )]
 pub struct Cli {
     /// Search query. Omit to launch the interactive TUI.
@@ -126,22 +122,6 @@ pub struct Cli {
     #[arg(long, value_name = "WINDOW", help = "Time window: 30m, 1h, 2d, 1w")]
     pub last: Option<String>,
 
-    // ── Stack filter ───────────────────────────────────────────────
-    /// Filter by tech-stack tags (repeatable).
-    ///
-    /// Matches commands captured in projects that contain specific
-    /// marker files (e.g. `Cargo.toml` → `cargo`, `Dockerfile` →
-    /// `docker`). Can be repeated to narrow results:
-    /// `-t cargo -t docker`.
-    #[arg(
-        short = 't',
-        long = "tag",
-        value_name = "TAG",
-        action = ArgAction::Append,
-        help = "Filter by tech-stack tag (repeatable, e.g. -t cargo -t docker)"
-    )]
-    pub tags: Vec<String>,
-
     // ── Subcommands ────────────────────────────────────────────────
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -149,10 +129,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum Commands {
-    /// Pin a command to prevent it from decaying in search ranking.
+    /// Pin a command by its numeric ID.
     ///
-    /// Pinned commands always appear at the top of results regardless
-    /// of recency or frequency scores.
+    /// The command is remembered in the `pins` list and surfaces in
+    /// `hs pins` for quick recall. Pinning is idempotent. Use the ID
+    /// shown in `hs` search results.
     Pin {
         /// The numeric ID of the command to pin (from `hs` search results).
         id: i64,
@@ -160,7 +141,8 @@ pub enum Commands {
 
     /// Remove a pin from a previously pinned command.
     ///
-    /// The command will return to normal ranking behavior.
+    /// The command disappears from `hs pins` on the next invocation.
+    /// Unpinning an unpinned command is a no-op and still exits 0.
     Unpin {
         /// The numeric ID of the command to unpin.
         id: i64,
@@ -168,8 +150,7 @@ pub enum Commands {
 
     /// List all currently pinned commands.
     ///
-    /// Shows the command string, project, and pin timestamp for each
-    /// pinned entry.
+    /// Shows each pinned command's string, project, and pin timestamp.
     Pins,
 
     /// Import standard shell history into the hs database.
@@ -315,9 +296,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_repeatable_tags() {
-        let cli = Cli::try_parse_from(["hs", "-t", "cargo", "-t", "docker", "build"]).unwrap();
-        assert_eq!(cli.tags, vec!["cargo", "docker"]);
+    fn tag_flag_is_rejected() {
+        let result = Cli::try_parse_from(["hs", "-t", "cargo", "build"]);
+        assert!(result.is_err(), "removed -t/--tag must be rejected");
+
+        let result = Cli::try_parse_from(["hs", "--tag", "docker", "build"]);
+        assert!(result.is_err(), "removed --tag must be rejected");
     }
 
     #[test]
@@ -448,22 +432,12 @@ mod tests {
 
     #[test]
     fn combined_flags() {
-        let cli = Cli::try_parse_from([
-            "hs",
-            "--project",
-            "--ok",
-            "--last",
-            "1w",
-            "-t",
-            "cargo",
-            "build",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["hs", "--project", "--ok", "--last", "1w", "build"]).unwrap();
 
         assert!(cli.project);
         assert!(cli.ok);
         assert_eq!(cli.last.as_deref(), Some("1w"));
-        assert_eq!(cli.tags, vec!["cargo"]);
         assert_eq!(cli.query, Some(vec!["build".into()]));
     }
 }

@@ -11,6 +11,7 @@ use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
 use comfy_table::{Cell, Color, Table};
 
+use crate::models::PinnedCommand;
 use crate::ranking::RankedCommand;
 
 /// Maximum characters for a command shown in the one-line table/list.
@@ -56,10 +57,13 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
             format!("{:.0}%", 100.0 * r.success_count as f64 / total as f64)
         };
 
+        // Pinned commands get a dedicated marker prefix so they are
+        // recognizable in plain-text (piped) output too.
+        let pin_marker = if r.is_pinned { "📌 " } else { "" };
         let rank_marker = if in_project { "→" } else { " " };
         let cells: Vec<Cell> = vec![
             Cell::new(format!("{rank_marker}{}", i + 1)),
-            Cell::new(ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS)),
+            Cell::new(format!("{pin_marker}{}", ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS))),
             Cell::new(format!("{:.2}", r.final_score)),
             Cell::new(total),
             Cell::new(success_rate),
@@ -67,7 +71,9 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
         ];
 
         let cells = if colored {
-            let fg = if in_project {
+            let fg = if r.is_pinned {
+                Color::Yellow
+            } else if in_project {
                 Color::Green
             } else {
                 Color::DarkGrey
@@ -81,14 +87,58 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
     }
 
     println!("{table}");
-    println!(
-        "{}",
-        if colored {
-            "\x1b[2m→ commands from the current project\x1b[0m"
+
+    let has_pinned = results.iter().any(|r| r.is_pinned);
+    let has_current = results
+        .iter()
+        .any(|r| current_project_id.is_some() && r.project_id == current_project_id);
+
+    let mut legend: Vec<String> = Vec::new();
+    if has_pinned {
+        legend.push(if colored {
+            "\x1b[1;33m📌 pinned command\x1b[0m".to_string()
         } else {
-            "→ commands from the current project"
-        }
-    );
+            "📌 pinned command".to_string()
+        });
+    }
+    if has_current {
+        legend.push(if colored {
+            "\x1b[2m→ commands from the current project\x1b[0m".to_string()
+        } else {
+            "→ commands from the current project".to_string()
+        });
+    }
+    if !legend.is_empty() {
+        println!("{}", legend.join("   "));
+    }
+}
+
+/// Print the pinned-command list as a table, or a quiet message when empty.
+///
+/// Columns: `ID`, `Command`, `Project`, `Pinned At`. The command column is
+/// ellipsized like search results so long pins cannot blow up the layout.
+pub fn print_pins_table(pins: &[PinnedCommand]) {
+    if pins.is_empty() {
+        println!("No pinned commands.");
+        return;
+    }
+
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header(["ID", "Command", "Project", "Pinned At"]);
+
+    for pin in pins {
+        table.add_row([
+            Cell::new(pin.command_id),
+            Cell::new(ellipsize(&pin.cmd_string, MAX_DISPLAY_CHARS)),
+            Cell::new(pin.project_path.as_deref().unwrap_or("–")),
+            Cell::new(pin.pinned_at.format("%Y-%m-%d %H:%M").to_string()),
+        ]);
+    }
+
+    println!("{table}");
 }
 
 /// Trim an RFC 3339 timestamp to `YYYY-MM-DD HH:MM` (UTC).
@@ -116,6 +166,7 @@ mod tests {
             success_count: 8,
             fail_count: 2,
             last_executed_at: Some("2026-09-08T10:11:12Z".to_string()),
+            is_pinned: false,
         }
     }
 
@@ -158,6 +209,7 @@ mod tests {
             success_count: 1,
             fail_count: 0,
             last_executed_at: Some("2026-09-08T10:11:12Z".to_string()),
+            is_pinned: false,
         }];
         // Rendering must not panic or emit the full command.
         print_results_table(&rows, None);
@@ -171,5 +223,40 @@ mod tests {
             sample(None, 1.0),
         ];
         print_results_table(&rows, Some(3));
+    }
+
+    #[test]
+    fn table_flags_pinned_commands() {
+        let mut pinned = sample(Some(3), 4.0);
+        pinned.is_pinned = true;
+        let rows = vec![pinned, sample(Some(9), 2.0)];
+        print_results_table(&rows, Some(3));
+    }
+
+    #[test]
+    fn empty_pins_prints_notice() {
+        print_pins_table(&[]);
+    }
+
+    #[test]
+    fn pins_table_renders_all_columns() {
+        let pinned_at = chrono::DateTime::parse_from_rfc3339("2026-09-09T10:11:12Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let pins = vec![
+            PinnedCommand {
+                command_id: 7,
+                cmd_string: "cargo deploy --prod".to_string(),
+                project_path: Some("/repo/app".to_string()),
+                pinned_at,
+            },
+            PinnedCommand {
+                command_id: 3,
+                cmd_string: "echo standalone".to_string(),
+                project_path: None,
+                pinned_at,
+            },
+        ];
+        print_pins_table(&pins);
     }
 }
