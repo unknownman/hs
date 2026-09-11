@@ -113,6 +113,14 @@ fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
         .and_then(|path| store.get_project_id_by_path(path).ok())
         .flatten();
 
+    // `--project` is an explicit request to scope results to *this* git
+    // repository. Outside a repo there is nothing to scope to — fail
+    // loudly instead of silently degrading to a `--global` search.
+    if let Some(msg) = project_scope_mismatch(cli.project, current_project_id) {
+        eprintln!("{msg}");
+        return Ok(1);
+    }
+
     let query = cli.query.clone().map(|words| words.join(" "));
 
     let ctx = SearchContext {
@@ -164,6 +172,22 @@ fn execute_and_record(pool: &DbPool, cmd: &str, cwd: &Path) -> Result<i32, HsErr
     }
 
     Ok(exit_code)
+}
+
+/// Decode why `--project` cannot be honored for the current directory.
+///
+/// Returns the user-facing message when an explicit `--project` request
+/// could not resolve to a git project (i.e. we're outside any repo), and
+/// `None` when the search may proceed as normal.
+fn project_scope_mismatch(
+    cli_project: bool,
+    current_project_id: Option<i64>,
+) -> Option<&'static str> {
+    if cli_project && current_project_id.is_none() {
+        Some("hs: --project flag requires being inside a git repository")
+    } else {
+        None
+    }
 }
 
 /// Decide whether to launch the interactive TUI or print a table.
@@ -292,6 +316,19 @@ mod tests {
         // Non-terminal (pipe/script) honors --print → table.
         assert!(!should_launch_tui(false, false));
         assert!(!should_launch_tui(true, false));
+    }
+
+    #[test]
+    fn project_scope_mismatch_flags_missing_repo() {
+        // Outside a git repo, `--project` must refuse to search globally.
+        let msg = project_scope_mismatch(true, None).unwrap();
+        assert!(msg.contains("--project"));
+        assert!(msg.contains("git repository"));
+
+        // Inside a repo (or without --project) the guard stays silent.
+        assert_eq!(project_scope_mismatch(false, None), None);
+        assert_eq!(project_scope_mismatch(true, Some(7)), None);
+        assert_eq!(project_scope_mismatch(false, Some(7)), None);
     }
 
     #[test]

@@ -58,9 +58,9 @@ pub fn init_db(db_path: &Path) -> Result<DbPool, HsError> {
     // to switch journal modes.  `busy_timeout` makes that transient
     // condition wait instead of fail.
     {
-        let conn = pool.get()?;
+        let mut conn = pool.get()?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        migrations::run(&conn)?;
+        migrations::run(&mut conn)?;
     }
 
     Ok(pool)
@@ -99,8 +99,8 @@ pub(crate) mod tests {
             .expect("failed to build test pool");
 
         // Apply schema migrations.
-        let conn = pool.get().expect("failed to get connection");
-        migrations::run(&conn).expect("migrations failed");
+        let mut conn = pool.get().expect("failed to get connection");
+        migrations::run(&mut conn).expect("migrations failed");
 
         pool
     }

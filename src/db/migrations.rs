@@ -29,31 +29,44 @@ const CURRENT_VERSION: u32 = 1;
 
 /// Run all pending migrations against `conn`.
 ///
-/// Idempotent — safe to call on every `hs` startup.
-pub fn run(conn: &Connection) -> Result<(), HsError> {
-    let current: u32 = conn
+/// Idempotent — safe to call on every `hs` startup. The read-apply-update
+/// sequence runs inside an `EXCLUSIVE` transaction so that concurrent
+/// first-launches (e.g. a fresh machine opening many terminal panes at
+/// once) serialize on the single writer instead of racing schema
+/// creation. `busy_timeout`, set on every pooled connection, makes the
+/// losers wait their turn rather than fail with `SQLITE_LOCKED`.
+pub fn run(conn: &mut Connection) -> Result<(), HsError> {
+    // Everything — the user_version probe, the DDL, and the version bump —
+    // must be atomic: two shells starting on a fresh database would
+    // otherwise both observe `user_version` = 0 and clobber each other's
+    // schema.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
+        .map_err(HsError::DatabaseError)?;
+
+    let current: u32 = tx
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(HsError::DatabaseError)?;
 
-    if current >= CURRENT_VERSION {
-        return Ok(());
-    }
-
     // V1: fully normalized schema + FTS5 + stats triggers
     if current < 1 {
-        conn.execute_batch(V1_MIGRATION)
+        tx.execute_batch(V1_MIGRATION)
             .map_err(|e| HsError::MigrationError {
                 step: 1,
                 message: e.to_string(),
             })?;
     }
 
-    // Mark schema as up-to-date.
-    conn.execute_batch(&format!("PRAGMA user_version = {CURRENT_VERSION}"))
-        .map_err(|e| HsError::MigrationError {
-            step: CURRENT_VERSION,
-            message: e.to_string(),
-        })?;
+    // Mark schema as up-to-date (no-op when already current).
+    if current < CURRENT_VERSION {
+        tx.execute_batch(&format!("PRAGMA user_version = {CURRENT_VERSION}"))
+            .map_err(|e| HsError::MigrationError {
+                step: CURRENT_VERSION,
+                message: e.to_string(),
+            })?;
+    }
+
+    tx.commit().map_err(HsError::DatabaseError)?;
 
     Ok(())
 }
