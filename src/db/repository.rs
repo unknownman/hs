@@ -297,14 +297,23 @@ impl Store {
     ///
     /// Pinning is idempotent: re-pinning an already-pinned command is a
     /// no-op (the `pins` table uses the command id as its primary key).
-    /// Pinning a command id that does not exist fails via the foreign key.
-    pub fn pin_command(&self, command_id: i64) -> Result<(), HsError> {
+    /// Returns `true` when the pin exists (inserted or already present),
+    /// and `false` when no command with that id exists.
+    pub fn pin_command(&self, command_id: i64) -> Result<bool, HsError> {
         let conn = self.pool.get()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM commands WHERE id = ?1)",
+            params![command_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
         conn.execute(
             "INSERT OR IGNORE INTO pins (command_id) VALUES (?1)",
             params![command_id],
         )?;
-        Ok(())
+        Ok(true)
     }
 
     /// Remove a pin from a previously pinned command.
@@ -667,10 +676,13 @@ mod tests {
     }
 
     #[test]
-    fn pin_missing_command_errors() {
+    fn pin_missing_command_returns_ok_false() {
         let store = test_store();
         let result = store.pin_command(999999);
-        assert!(result.is_err(), "pinning a nonexistent command must fail");
+        assert!(
+            matches!(result, Ok(false)),
+            "pinning a nonexistent command must degrade gracefully, got {result:?}"
+        );
     }
 
     #[test]

@@ -46,54 +46,7 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
     }
 
     let colored = io::stdout().is_terminal();
-
-    let mut table = Table::new();
-    table
-        .load_preset(UTF8_FULL)
-        .apply_modifier(UTF8_ROUND_CORNERS)
-        .set_header(["#", "Command", "Score", "Runs", "Success", "Last Run"]);
-
-    for (i, r) in results.iter().take(MAX_PRINT_ROWS).enumerate() {
-        let in_project = current_project_id.is_some() && r.project_id == current_project_id;
-        let total = r.success_count + r.fail_count;
-        let success_rate = if total == 0 {
-            "–".to_string()
-        } else {
-            format!("{:.0}%", 100.0 * r.success_count as f64 / total as f64)
-        };
-
-        // Pinned commands get a dedicated marker prefix so they are
-        // recognizable in plain-text (piped) output too.
-        let pin_marker = if r.is_pinned { "📌 " } else { "" };
-        let rank_marker = if in_project { "→" } else { " " };
-        let cells: Vec<Cell> = vec![
-            Cell::new(format!("{rank_marker}{}", i + 1)),
-            Cell::new(format!(
-                "{pin_marker}{}",
-                ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS)
-            )),
-            Cell::new(format!("{:.2}", r.final_score)).set_alignment(CellAlignment::Right),
-            Cell::new(total).set_alignment(CellAlignment::Right),
-            Cell::new(success_rate).set_alignment(CellAlignment::Right),
-            Cell::new(short_date(r.last_executed_at.as_deref()))
-                .set_alignment(CellAlignment::Right),
-        ];
-
-        let cells = if colored {
-            let fg = if r.is_pinned {
-                Color::Yellow
-            } else if in_project {
-                Color::Green
-            } else {
-                Color::DarkGrey
-            };
-            cells.into_iter().map(|cell| cell.fg(fg)).collect()
-        } else {
-            cells
-        };
-
-        table.add_row(cells);
-    }
+    let table = results_table(results, current_project_id, colored);
 
     println!("{table}");
 
@@ -126,6 +79,71 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
     if !legend.is_empty() {
         println!("{}", legend.join("   "));
     }
+}
+
+/// Build the ranked-results table (capped at [`MAX_PRINT_ROWS`] rows).
+///
+/// Every row exposes the underlying `command_id` in its own `ID` column
+/// (distinct from the running `Rank` number) so `hs pin <ID>` and
+/// `hs delete <ID>` are usable straight from the table. Extracted from
+/// [`print_results_table`] so tests can assert on the rendered output.
+fn results_table(
+    results: &[RankedCommand],
+    current_project_id: Option<i64>,
+    colored: bool,
+) -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL)
+        .apply_modifier(UTF8_ROUND_CORNERS)
+        .set_header([
+            "Rank", "ID", "Command", "Score", "Runs", "Success", "Last Run",
+        ]);
+
+    for (i, r) in results.iter().take(MAX_PRINT_ROWS).enumerate() {
+        let in_project = current_project_id.is_some() && r.project_id == current_project_id;
+        let total = r.success_count + r.fail_count;
+        let success_rate = if total == 0 {
+            "–".to_string()
+        } else {
+            format!("{:.0}%", 100.0 * r.success_count as f64 / total as f64)
+        };
+
+        // Pinned commands get a dedicated marker prefix so they are
+        // recognizable in plain-text (piped) output too.
+        let pin_marker = if r.is_pinned { "📌 " } else { "" };
+        let rank_marker = if in_project { "→" } else { " " };
+        let cells: Vec<Cell> = vec![
+            Cell::new(format!("{rank_marker}{}", i + 1)),
+            Cell::new(r.command_id),
+            Cell::new(format!(
+                "{pin_marker}{}",
+                ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS)
+            )),
+            Cell::new(format!("{:.2}", r.final_score)).set_alignment(CellAlignment::Right),
+            Cell::new(total).set_alignment(CellAlignment::Right),
+            Cell::new(success_rate).set_alignment(CellAlignment::Right),
+            Cell::new(short_date(r.last_executed_at.as_deref()))
+                .set_alignment(CellAlignment::Right),
+        ];
+
+        let cells = if colored {
+            let fg = if r.is_pinned {
+                Color::Yellow
+            } else if in_project {
+                Color::Green
+            } else {
+                Color::DarkGrey
+            };
+            cells.into_iter().map(|cell| cell.fg(fg)).collect()
+        } else {
+            cells
+        };
+
+        table.add_row(cells);
+    }
+
+    table
 }
 
 /// `... and X more (...)`, iff more than [`MAX_PRINT_ROWS`] rows exist.
@@ -275,6 +293,28 @@ mod tests {
             sample(None, 1.0),
         ];
         print_results_table(&rows, Some(3));
+    }
+
+    #[test]
+    fn table_renders_distinct_id_column() {
+        // A distinctive command_id (never a rank/score/timestamp) must
+        // surface in its own `ID` column, alongside the `Rank` header.
+        let mut row = sample(Some(3), 4.0);
+        row.command_id = 987654321;
+        let rendered = results_table(&[row], Some(3), false).to_string();
+
+        assert!(
+            rendered.contains("987654321"),
+            "ID column must show the command_id, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("Rank") && rendered.contains("ID"),
+            "headers must include both Rank and ID: {rendered}"
+        );
+        assert!(
+            rendered.contains("│ →1"),
+            "rank cell (→1) leads the data row: {rendered}"
+        );
     }
 
     #[test]

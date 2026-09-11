@@ -253,8 +253,9 @@ fn render(
 
             let lines = vec![
                 ratatui::text::Line::from(format!(
-                    "{}Score {:.2}  ·  {} run(s)  ·  success rate {}  ·  last: {}",
+                    "{}ID: {}  ·  Score {:.2}  ·  {} run(s)  ·  success rate {}  ·  last: {}",
                     if r.is_pinned { " 📌 PINNED  " } else { "" },
+                    r.command_id,
                     r.final_score,
                     total,
                     rate,
@@ -371,10 +372,9 @@ mod tests {
     fn renders_without_panicking() {
         use ratatui::backend::TestBackend;
 
-        let results = vec![
-            sample("cargo build --release", Some(3)),
-            sample("docker build -t app .", None),
-        ];
+        let mut selected = sample("cargo build --release", Some(3));
+        selected.command_id = 7;
+        let results = vec![selected, sample("docker build -t app .", None)];
         let rows = build_rows(&results, Some(3));
         let mut state = ListState::default();
         state.select(Some(1)); // first command row
@@ -399,6 +399,10 @@ mod tests {
             "section header must render"
         );
         assert!(text.contains("SAFE"), "preview risk badge must render");
+        assert!(
+            text.contains("ID: 7"),
+            "preview must expose the command id, got: {text:?}"
+        );
     }
 
     #[test]
@@ -428,6 +432,10 @@ mod tests {
         assert!(
             text.contains("PINNED"),
             "preview must show the PINNED badge, got: {text:?}"
+        );
+        assert!(
+            text.contains("ID: 1"),
+            "preview must expose the pinned command's id, got: {text:?}"
         );
     }
 
@@ -465,6 +473,10 @@ mod tests {
         assert!(
             text.contains("Score"),
             "preview must show the stat line, got: {text:?}"
+        );
+        assert!(
+            text.contains("ID: 1"),
+            "preview must expose the command id even for huge commands, got: {text:?}"
         );
     }
 }

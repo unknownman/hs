@@ -56,7 +56,8 @@ leaks" is verified both by the redaction engine and by a live search.
 
 ```sh
 hs --print echo
-# EXPECT: a numbered table of echo commands. Note the ID of the first row.
+# EXPECT: a ranked table of echo commands with distinct Rank and ID columns.
+# The first data row shows Rank 1 and ID 1.
 
 hs pin 1
 # EXPECT: [hs] Pinned command #1

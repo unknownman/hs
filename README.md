@@ -81,13 +81,13 @@ its run statistics, and a live risk classification badge.
 ```
 ┌ hs — What worked here before? ─────────────┐
 │ ── Current project ─────────────────────── │
-│ > migrate --database=prod   1.17 1  100%  │
+│ ▶ migrate --database=prod                 │
 │ ── Global / other ──────────────────────── │
-│   make migrate              0.64 3   66%  │
+│   make migrate                            │
 ├─────────────────────────────── Preview ──  ┤
+│  ID: 1  ·  Score 1.17  ·  1 run(s)  ·  100%│
 │  migrate --database=prod                  │
-│  [SAFE]  Runs: 1 · Success: 100%          │
-│  Last run: 2 h ago                        │
+│  [SAFE]                                    │
 └───────────────────────────────────────────┘
 ↑/↓ navigate   Enter run   Esc / Ctrl-C exit
 ```
@@ -127,7 +127,7 @@ results — double-check before you run it.
 Pinning keeps a critical command on a dedicated list, independent of ranking. Pinned commands also receive a **score boost** in search results, so they always surface to the top — even if their run history is sparse:
 
 ```sh
-hs pin 42          # remember command #42
+hs pin 42          # the ID column of the first row (→1) in the table above
 hs pins            # table of pinned commands (ID, Command, Project, Pinned At)
 hs unpin 42        # forget it again
 ```
@@ -139,13 +139,13 @@ also deletes its pin. An empty pin list prints `No pinned commands.`
 `--print` (or any non-TTY stdout, e.g. `hs foo | less`) prints a table and exits:
 
 ```
-╭────┬─────────────────────────────┬───────┬──────┬─────────┬──────────────────╮
-│ #  ┆ Command                     ┆ Score ┆ Runs ┆ Success ┆ Last Run         │
-╞════╪═════════════════════════════╪═══════╪══════╪═════════╪══════════════════╡
-│ →1 ┆ echo hello-from-hs-project  ┆  1.17 ┆    1 ┆    100% ┆ 2026-09-09 15:10 │
-├╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│  2 ┆ echo global-universal-hello ┆  0.64 ┆    1 ┆    100% ┆ 2026-09-09 15:10 │
-╰────┴─────────────────────────────┴───────┴──────┴─────────┴──────────────────╯
+╭──────┬────┬─────────────────────────────┬───────┬──────┬─────────┬──────────────────╮
+│ Rank ┆ ID ┆ Command                     ┆ Score ┆ Runs ┆ Success ┆ Last Run         │
+╞══════╪════╪═════════════════════════════╪═══════╪══════╪═════════╪══════════════════╡
+│ →1   ┆ 42 ┆ echo hello-from-hs-project  ┆  9.20 ┆    1 ┆    100% ┆ 2026-09-11 14:55 │
+├╌╌╌╌╌╌┼╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│  2   ┆ 43 ┆ echo global-universal-hello ┆  5.07 ┆    1 ┆    100% ┆ 2026-09-11 14:55 │
+╰──────┴────┴─────────────────────────────┴───────┴──────┴─────────┴──────────────────╯
 → commands from the current project
 ```
 

@@ -245,11 +245,20 @@ fn default_db_path() -> Result<PathBuf, HsError> {
 // ── Subcommand handlers ────────────────────────────────────────────────────
 
 /// Pin a command by ID, so it surfaces in `hs pins`.
+///
+/// Exits 1 with a friendly message when no command has that id.
 fn cmd_pin(pool: &DbPool, id: i64) -> Result<i32, HsError> {
     let store = db::repository::Store::new(pool.clone());
-    store.pin_command(id)?;
-    println!("[hs] Pinned command #{id}");
-    Ok(0)
+    match store.pin_command(id)? {
+        true => {
+            println!("[hs] Pinned command #{id}");
+            Ok(0)
+        }
+        false => {
+            eprintln!("[hs] No command found with id #{id}.");
+            Ok(1)
+        }
+    }
 }
 
 /// Unpin a command by ID. No-op (but still an exit 0) if not pinned.
