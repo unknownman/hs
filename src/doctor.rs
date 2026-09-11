@@ -67,9 +67,7 @@ pub fn run_doctor(db_path: &Path) -> i32 {
                         let executions: i64 = conn
                             .query_row("SELECT COUNT(*) FROM executions", [], |r| r.get(0))
                             .unwrap_or(0);
-                        let size = std::fs::metadata(db_path)
-                            .map(|m| human_size(m.len()))
-                            .unwrap_or_else(|_| "?".to_string());
+                        let size = human_size(database_size_plus_sidecars(db_path));
                         println!(
                             "{CHECK}{} unique commands · {} executions · {} on disk",
                             thousands(commands),
@@ -116,6 +114,21 @@ fn writable(dir: &Path) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Total bytes the database occupies on disk.
+///
+/// SQLite runs in WAL mode, so live pages live in `hs.db-wal` (and
+/// `hs.db-shm`, the shared-memory index) until a checkpoint. The main
+/// `hs.db` plainly understates real disk usage; count all three files.
+fn database_size_plus_sidecars(db_path: &Path) -> u64 {
+    let mut bytes = std::fs::metadata(db_path).map(|m| m.len()).unwrap_or(0);
+    for sidecar in ["db-wal", "db-shm"] {
+        if let Ok(metadata) = std::fs::metadata(db_path.with_extension(sidecar)) {
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+    bytes
 }
 
 /// Describe whether `rc_path` sources the `hs` hook.
@@ -185,5 +198,36 @@ mod tests {
         assert_eq!(human_size(1024), "1 KB");
         assert_eq!(human_size(420 * 1024), "420 KB");
         assert_eq!(human_size(4_200_000), "4.0 MB");
+    }
+
+    #[test]
+    fn database_size_includes_wal_and_shm_sidecars() {
+        let tmp = std::env::temp_dir().join(format!(
+            "hs_doctor_size_{:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let db = tmp.join("hs.db");
+        std::fs::write(&db, vec![0u8; 400]).unwrap();
+        std::fs::write(db.with_extension("db-wal"), vec![0u8; 600]).unwrap();
+        std::fs::write(db.with_extension("db-shm"), vec![0u8; 32 * 1024]).unwrap();
+
+        assert_eq!(database_size_plus_sidecars(&db), 400 + 600 + 32 * 1024);
+
+        // Missing sidecars are simply skipped; only the main file counts.
+        std::fs::remove_file(db.with_extension("db-wal")).unwrap();
+        assert_eq!(database_size_plus_sidecars(&db), 400 + 32 * 1024);
+
+        // Missing main file reports zero rather than panicking. Use a
+        // distinct name — with_extension(..) on `hs.db-nope` would rewrite
+        // to `hs.db-shm`, which still exists.
+        let other = tmp.join("other.db");
+        assert_eq!(database_size_plus_sidecars(&other), 0);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -30,6 +30,21 @@ pub fn execute_safely_with<F>(cmd_string: &str, confirm: F) -> Result<i32, HsErr
 where
     F: FnOnce(&str) -> bool,
 {
+    // A command containing a literally-redacted secret (`[REDACTED]`) is
+    // guaranteed to fail as written (the TUI offers no in-place editing).
+    // Intercept it before the risk classifier and demand an explicit
+    // confirmation; declining aborts just like a declined High Risk.
+    if cmd_string.contains("[REDACTED]") {
+        eprintln!("\x1b[1;33m[!] WARNING: This command contains [REDACTED] secrets.\x1b[0m");
+        eprintln!("    It will likely fail unless you manually edit and run it outside hs.");
+        eprintln!("    {cmd_string}");
+        return if confirm(cmd_string) {
+            run_child(cmd_string)
+        } else {
+            Err(HsError::Cancelled)
+        };
+    }
+
     match analyze_risk(cmd_string) {
         RiskLevel::Safe => run_child(cmd_string),
         RiskLevel::High => {
@@ -149,6 +164,37 @@ mod tests {
 
         assert_eq!(code, 0, "child exit code must propagate");
         assert_eq!(probe.called_with, vec![cmd.to_string()]);
+    }
+
+    #[test]
+    fn redacted_command_triggers_confirmation() {
+        // A `[REDACTED]` secret leaks no credentials, so the command never
+        // spells out a real token and is harmless to truly run — but the
+        // guard must still demand confirmation before letting it through.
+        // Quoting prevents `[REDACTED]` from being glob-expanded by the shell.
+        let redacted = "printf '%s\\n' '[REDACTED] secret-token'";
+
+        // Declining aborts with Cancelled, exactly once, no subprocess.
+        let mut probe = Probe::from(false);
+        let result = execute_safely_with(redacted, |cmd| {
+            probe.called_with.push(cmd.to_string());
+            probe.answer
+        });
+        assert!(
+            matches!(result, Err(HsError::Cancelled)),
+            "declined redacted command must yield Cancelled, got: {result:?}"
+        );
+        assert_eq!(probe.called_with, vec![redacted.to_string()]);
+
+        // Confirming proceeds and runs the command.
+        let mut probe = Probe::from(true);
+        let code = execute_safely_with(redacted, |cmd| {
+            probe.called_with.push(cmd.to_string());
+            probe.answer
+        })
+        .expect("confirmed redacted command must run");
+        assert_eq!(code, 0, "child exit code must propagate");
+        assert_eq!(probe.called_with, vec![redacted.to_string()]);
     }
 
     #[test]

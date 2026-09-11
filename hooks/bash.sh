@@ -44,7 +44,10 @@ trap '_hs_preexec' DEBUG
 # --- Pre-prompt: the previous command finished ------------------------------
 _hs_precmd() {
     local exit_code=$?
-    [[ -z "$_hs_last_cmd" ]] && return
+    # Preserve the user's exit code even when there is nothing to capture
+    # (e.g. Enter on an empty line): the PROMPT_COMMAND status becomes the
+    # one the prompt displays.
+    [[ -z "$_hs_last_cmd" ]] && return $exit_code
     local end_ms
     end_ms="$(_hs_now_ms)"
     local duration_ms=0
@@ -64,5 +67,9 @@ _hs_precmd() {
 
     _hs_last_cmd=""
     _hs_start_ms=""
+    # End with the user's exit code instead of the success of the
+    # assignments above; otherwise $? (and prompt themes like Starship)
+    # would always see 0.
+    return $exit_code
 }
 PROMPT_COMMAND="_hs_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"

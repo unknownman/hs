@@ -182,6 +182,13 @@ impl Cli {
                     true
                 }
                 "--last" => false,
+                // `--last=1d` — standard clap `--flag=value` syntax bound
+                // with `=`. The whole token is one string, so strip the
+                // flag prefix and hoist its remainder as the window.
+                kind if kind.starts_with("--last=") => {
+                    self.last = Some(kind[7..].to_string());
+                    true
+                }
                 _ => false,
             };
             if hoisted {
@@ -413,6 +420,28 @@ mod tests {
         assert_eq!(
             cli.query,
             Some(vec!["docker".to_string(), "--last".to_string()])
+        );
+    }
+
+    #[test]
+    fn flags_with_equals_are_normalized() {
+        // `hs docker --last=1d` — standard `--flag=value` syntax — must
+        // hoist the bound value into the window filter, not leak `--last=1d`
+        // into the FTS query as a literal search term.
+        let mut cli = Cli::try_parse_from(["hs", "docker", "--last=1d"]).unwrap();
+        cli.normalize_embedded_flags();
+        assert_eq!(cli.last.as_deref(), Some("1d"));
+        assert_eq!(cli.query, Some(vec!["docker".to_string()]));
+
+        // `=`-bound boolean flags work too, mixing with later `--last`.
+        let mut cli =
+            Cli::try_parse_from(["hs", "docker", "build", "--print", "--last=2d"]).unwrap();
+        cli.normalize_embedded_flags();
+        assert!(cli.print);
+        assert_eq!(cli.last.as_deref(), Some("2d"));
+        assert_eq!(
+            cli.query,
+            Some(vec!["docker".to_string(), "build".to_string()])
         );
     }
 
