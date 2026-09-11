@@ -1186,6 +1186,80 @@ mod tests {
         );
     }
 
+    /// Regression: `hs import` ingests *old* history, and its backdated
+    /// timestamps must never downgrade the recency of a command the user
+    /// is actively running. `last_executed_at` only moves forward.
+    #[test]
+    fn importing_old_history_does_not_downgrade_recency() {
+        let store = test_store();
+
+        // 1. A fresh execution for the command (executed_at = "now").
+        store
+            .insert_execution(Some("/proj"), "deploy app", 0, 100, "/proj")
+            .unwrap();
+        let command_id = command_id(&store, "deploy app", Some("/proj"));
+
+        let fresh: String = {
+            let conn = store.pool.get().unwrap();
+            conn.query_row(
+                "SELECT last_executed_at FROM command_stats WHERE command_id = ?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // 2. An OLD execution lands (e.g. a 2020 line from the legacy
+        //    history file) — the same pathway `import_entries` uses.
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO executions
+                     (command_id, exit_code, duration_ms, working_dir, executed_at)
+                 VALUES (?1, 0, 50, '/proj', '2020-01-01T00:00:00Z')",
+                [command_id],
+            )
+            .unwrap();
+        }
+
+        let after_old: String = {
+            let conn = store.pool.get().unwrap();
+            conn.query_row(
+                "SELECT last_executed_at FROM command_stats WHERE command_id = ?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            after_old, fresh,
+            "an older import must not downgrade last_executed_at"
+        );
+
+        // 3. A genuinely newer execution must still advance the clock.
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "INSERT INTO executions
+                     (command_id, exit_code, duration_ms, working_dir, executed_at)
+                 VALUES (?1, 0, 50, '/proj', '2100-01-01T00:00:00Z')",
+                [command_id],
+            )
+            .unwrap();
+        }
+
+        let after_new: String = {
+            let conn = store.pool.get().unwrap();
+            conn.query_row(
+                "SELECT last_executed_at FROM command_stats WHERE command_id = ?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(after_new, "2100-01-01T00:00:00Z");
+    }
+
     /// Hard filters: --ok / --failed narrow candidate sets correctly.
     #[test]
     fn outcome_filters_narrow_candidates() {

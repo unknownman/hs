@@ -72,7 +72,20 @@ const PATTERN_LIST: &[(&str, &str)] = &[
     // 5. Bearer credentials: keep the `Bearer ` scheme, redact the token.
     //    Token charset excludes the surrounding `"`, so quotes survive.
     (r"(\bBearer\s+)[A-Za-z0-9_\-\.]+", "$1[REDACTED]"),
-    // 6. Inline environment assignments: keep the key, redact the value.
+    // 6. URL basic auth: `scheme://user:password@host`. The whole
+    //    credential portion (`user:pass`, `token:`, `user:p@ss`) is
+    //    masked while the scheme and `@` survive, keeping the URL intact.
+    //    Requires a colon so a bare `https://user@host` and paths like
+    //    `/@user` are never mistaken for credentials, and excludes `/`
+    //    so a hostname/port (`host:8080/path`) can't be swallowed. This
+    //    must run BEFORE the generic inline-env rule below: a URL like
+    //    `https://user:token@host` would otherwise hit the `token:`
+    //    keyword and mangle the host.
+    (
+        r"(\b[a-zA-Z][a-zA-Z0-9+.\-]*://)([^/@\s:]+:[^/\s]*)(@)",
+        "$1[REDACTED]$3",
+    ),
+    // 7. Inline environment assignments: keep the key, redact the value.
     //    Handles `KEY=value`, `KEY: value`, quoted and bare values.
     (
         r#"(?i)((?:password|secret|token|api_key|private_key|access_key)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s]+)"#,
@@ -158,6 +171,47 @@ mod tests {
         let output = sanitize_command(input);
         assert!(!output.contains("shhh123"));
         assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn url_basic_auth_redacted() {
+        // Classic Basic-Auth password in a URL is masked while the URL
+        // stays intact.
+        assert_eq!(
+            sanitize_command("curl https://admin:hunter2@api.com"),
+            "curl https://[REDACTED]@api.com"
+        );
+        // Empty password (`http://token:@...`) is redacted too.
+        assert_eq!(
+            sanitize_command("curl http://token:@api.example.com"),
+            "curl http://[REDACTED]@api.example.com"
+        );
+        // A `token:`-looking credential inside a URL must not fall into
+        // the inline-env pattern and mangle the host.
+        assert_eq!(
+            sanitize_command("curl https://user:token@api.example.com/health"),
+            "curl https://[REDACTED]@api.example.com/health"
+        );
+    }
+
+    #[test]
+    fn normal_urls_with_at_in_path_survive() {
+        // An `@` in the *path* (GitHub-style `/@user`) is not userinfo
+        // and must never be redacted.
+        assert_eq!(
+            sanitize_command("curl https://api.example.com/@user"),
+            "curl https://api.example.com/@user"
+        );
+        // A hostname:port URL is not Basic Auth.
+        assert_eq!(
+            sanitize_command("curl https://api.example.com:8080/health"),
+            "curl https://api.example.com:8080/health"
+        );
+        // A bare username without a password is not a credential.
+        assert_eq!(
+            sanitize_command("git clone https://user@github.com/acme/repo.git"),
+            "git clone https://user@github.com/acme/repo.git"
+        );
     }
 
     #[test]

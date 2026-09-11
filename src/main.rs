@@ -14,10 +14,10 @@ mod redaction;
 mod ui;
 
 use std::io::IsTerminal as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cli::{Cli, Commands, Shell};
 use crate::db::DbPool;
@@ -102,7 +102,7 @@ fn run(cli: Cli) -> Result<i32, HsError> {
 ///   selected command (guarded), `Esc`/`Ctrl-C` exits without running.
 fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
     let pool = get_pool()?;
-    let store = db::repository::Store::new(pool);
+    let store = db::repository::Store::new(pool.clone());
 
     // Establish the "current project" context for soft boost + grouping.
     let cwd = std::env::current_dir()?;
@@ -143,7 +143,30 @@ fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
         return Ok(0);
     }
 
-    ui::tui::run(&ranked, current_project_id)?.map_or(Ok(0), |cmd| guard::execute_safely(&cmd))
+    ui::tui::run(&ranked, current_project_id)?
+        .map_or(Ok(0), |cmd| execute_and_record(&pool, &cmd, &cwd))
+}
+
+/// Run a TUI-selected command and record it in the database.
+///
+/// The child runs in a non-interactive subshell (`$SHELL -c`), so the
+/// user's bash/zsh hooks never fire for it. Without this self-capture the
+/// `success_count` / `last_executed_at` of frequently-used commands would
+/// stagnate. Timing is measured around the child process and the result is
+/// fed straight back into [`capture::process_capture`].
+///
+/// Recording is strictly best-effort: a capture failure is logged and
+/// swallowed so it can never clobber the child's real exit code.
+fn execute_and_record(pool: &DbPool, cmd: &str, cwd: &Path) -> Result<i32, HsError> {
+    let start = std::time::Instant::now();
+    let exit_code = guard::execute_safely(cmd)?;
+    let duration_ms = start.elapsed().as_millis() as i64;
+
+    if let Err(e) = capture::process_capture(pool, cmd, cwd, exit_code, duration_ms) {
+        warn!(error = %e, "failed to record TUI-executed command");
+    }
+
+    Ok(exit_code)
 }
 
 /// Decide whether to launch the interactive TUI or print a table.
@@ -307,5 +330,41 @@ mod tests {
         // History exists but nothing matched → plain "no results".
         assert!(no_results_message(true).contains("No matching"));
         assert!(!no_results_message(true).contains("hs import"));
+    }
+
+    /// A TUI-executed command (run via `execute_and_record`) must be
+    /// persisted like a shell-hook capture: one execution row, and the
+    /// command's stats updated so recency/frequency ranking does not
+    /// stagnate.
+    #[test]
+    fn execute_and_record_self_captures_and_updates_stats() {
+        use crate::db::tests::test_pool;
+
+        let pool = test_pool();
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+
+        let code = execute_and_record(&pool, "true", &cwd).unwrap();
+        assert_eq!(code, 0, "child exit code must propagate");
+
+        let conn = pool.get().unwrap();
+        let executions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM executions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(executions, 1, "TUI execution must be recorded");
+
+        let (success_count, fail_count, last): (i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT s.success_count, s.fail_count, s.last_executed_at
+                 FROM command_stats s
+                 JOIN commands c ON c.id = s.command_id
+                 WHERE c.cmd_string = 'true'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(success_count, 1, "success_count must increment");
+        assert_eq!(fail_count, 0);
+        assert!(last.is_some(), "last_executed_at must be set");
     }
 }

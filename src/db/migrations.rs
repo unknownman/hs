@@ -148,6 +148,12 @@ END;
 
 -- ────────────────────────────────────────────────────────────────────
 -- Trigger to auto-update command_stats on each new execution
+--
+-- `last_executed_at` only ever moves *forward*: importing legacy shell
+-- history backdates executions, and a stale timestamp must never
+-- overwrite the recency of a command the user is actively running.
+-- ISO8601 (`strftime('%Y-%m-%dT%H:%M:%SZ')`) sorts lexically, so the
+-- plain `>` comparison is a correct chronological one.
 -- ────────────────────────────────────────────────────────────────────
 CREATE TRIGGER IF NOT EXISTS stats_on_insert AFTER INSERT ON executions BEGIN
     INSERT INTO command_stats (command_id, success_count, fail_count, last_executed_at)
@@ -160,6 +166,11 @@ CREATE TRIGGER IF NOT EXISTS stats_on_insert AFTER INSERT ON executions BEGIN
     ON CONFLICT(command_id) DO UPDATE SET
         success_count = command_stats.success_count + CASE WHEN excluded.success_count > 0 THEN 1 ELSE 0 END,
         fail_count    = command_stats.fail_count    + CASE WHEN excluded.fail_count    > 0 THEN 1 ELSE 0 END,
-        last_executed_at = excluded.last_executed_at;
+        last_executed_at = CASE
+            WHEN command_stats.last_executed_at IS NULL
+              OR excluded.last_executed_at > command_stats.last_executed_at
+            THEN excluded.last_executed_at
+            ELSE command_stats.last_executed_at
+        END;
 END;
 "#;
