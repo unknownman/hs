@@ -64,15 +64,22 @@ const PATTERN_LIST: &[(&str, &str)] = &[
     ),
     // 3. GitHub personal access tokens: `ghp_` + 36 alnum chars.
     (r"\bghp_[a-zA-Z0-9]{30,}\b", "[REDACTED]"),
-    // 4. JWTs: three dot-separated base64url segments starting with `eyJ`.
+    // 4. GitHub fine-grained personal access tokens: `github_pat_` +
+    //    60+ alnum/underscore chars, ending in 4-24 base62 chars.
+    (r"\bgithub_pat_[a-zA-Z0-9_]{60,}\b", "[REDACTED]"),
+    // 5. Slack tokens: `xoxb-`/`xoxp-`/`xoxa-`/`xoxr-` + a long
+    //    hex/base62 payload. Requires a substantial token so prose like
+    //    `xoxb-123` is not mangled.
+    (r"\bxox[bpar]-[a-zA-Z0-9\-]{20,}\b", "[REDACTED]"),
+    // 6. JWTs: three dot-separated base64url segments starting with `eyJ`.
     (
         r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
         "[REDACTED]",
     ),
-    // 5. Bearer credentials: keep the `Bearer ` scheme, redact the token.
+    // 7. Bearer credentials: keep the `Bearer ` scheme, redact the token.
     //    Token charset excludes the surrounding `"`, so quotes survive.
     (r"(\bBearer\s+)[A-Za-z0-9_\-\.]+", "$1[REDACTED]"),
-    // 6. URL basic auth: `scheme://user:password@host`. The whole
+    // 8. URL basic auth: `scheme://user:password@host`. The whole
     //    credential portion (`user:pass`, `token:`, `user:p@ss`) is
     //    masked while the scheme and `@` survive, keeping the URL intact.
     //    Requires a colon so a bare `https://user@host` and paths like
@@ -85,7 +92,7 @@ const PATTERN_LIST: &[(&str, &str)] = &[
         r"(\b[a-zA-Z][a-zA-Z0-9+.\-]*://)([^/@\s:]+:[^/\s]*)(@)",
         "$1[REDACTED]$3",
     ),
-    // 7. Inline environment assignments: keep the key, redact the value.
+    // 9. Inline environment assignments: keep the key, redact the value.
     //    Handles `KEY=value`, `KEY: value`, quoted and bare values.
     (
         r#"(?i)((?:password|secret|token|api_key|private_key|access_key)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s]+)"#,
@@ -142,6 +149,50 @@ mod tests {
             "git push https://ghp_123456789012345678901234567890123456@github.com/acme/repo.git";
         let expected = "git push https://[REDACTED]@github.com/acme/repo.git";
         assert_eq!(sanitize_command(input), expected);
+    }
+
+    #[test]
+    fn github_fine_grained_pat_redacted() {
+        // Fine-grained PATs are `github_pat_` + 82 base62 chars; build the
+        // fake token at runtime so no secret-shaped literal sits in source.
+        let token = format!("github_pat_{}{}", "AA".repeat(30), "bb".repeat(11));
+        let input = format!("git clone https://x-access-token:{token}@github.com/acme/repo.git");
+        let output = sanitize_command(&input);
+        assert!(
+            !output.contains("github_pat_"),
+            "fine-grained PAT must be fully redacted, got: {output}"
+        );
+        assert!(output.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn slack_tokens_redacted() {
+        for prefix in ["xoxb", "xoxp", "xoxa", "xoxr"] {
+            // Real tokens carry a long payload; build one at runtime.
+            let token = format!(
+                "{prefix}-{}{}-{}",
+                "1".repeat(15),
+                "A".repeat(10),
+                "9".repeat(5)
+            );
+            let input = format!(
+                "curl -H \"Authorization: {token}\" https://slack.com/api/chat.postMessage"
+            );
+            let output = sanitize_command(&input);
+            assert!(
+                !output.contains(prefix),
+                "Slack `{prefix}-` token must be redacted, got: {output}"
+            );
+            assert!(output.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn short_slack_like_prose_is_not_over_redacted() {
+        // A short `xoxb-...` fragment (prose, not a credential) survives:
+        // real Slack tokens are far longer than a handful of chars.
+        let input = "git commit -m \"saw xoxb-123 webhook channel\"";
+        assert_eq!(sanitize_command(input), input);
     }
 
     #[test]

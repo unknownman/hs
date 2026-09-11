@@ -7,7 +7,7 @@
 //! Exits `1` if any hard check fails, `0` otherwise. Shell-hook checks
 //! are soft (a user may legitimately only use one shell).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const CHECK: &str = "\x1b[32m[✓]\x1b[0m ";
 const CROSS: &str = "\x1b[31m[✗]\x1b[0m ";
@@ -89,10 +89,14 @@ pub fn run_doctor(db_path: &Path) -> i32 {
     }
 
     // 4. Shell hooks (soft check — user may only use one shell).
-    let bashrc = hook_status(dirs::home_dir().map(|h| h.join(".bashrc")).as_deref());
-    let zshrc = hook_status(dirs::home_dir().map(|h| h.join(".zshrc")).as_deref());
-    println!("{bashrc}");
-    println!("{zshrc}");
+    //    macOS defaults to *login* shells, so the hook commonly lives in
+    //    `~/.bash_profile` / `~/.zprofile`; check those as fallbacks so
+    //    macOS users never get a false negative for an installed hook.
+    let home = dirs::home_dir();
+    let bash = hook_status(home.as_deref(), &[".bashrc", ".bash_profile"]);
+    let zsh = hook_status(home.as_deref(), &[".zshrc", ".zprofile"]);
+    println!("{bash}");
+    println!("{zsh}");
 
     println!();
     if failed {
@@ -131,26 +135,46 @@ fn database_size_plus_sidecars(db_path: &Path) -> u64 {
     bytes
 }
 
-/// Describe whether `rc_path` sources the `hs` hook.
-fn hook_status(rc_path: Option<&Path>) -> String {
-    let Some(path) = rc_path else {
+/// Describe whether any of the candidate rc files sources the `hs` hook.
+///
+/// The first candidate is the interactive rc (`.bashrc`/`.zshrc`); the
+/// second is the login-shell rc (`.bash_profile`/`.zprofile`), which is
+/// where hooks live when shells run as login shells (the macOS default).
+/// A hook sourced in *any* existing candidate satisfies the check.
+fn hook_status(home: Option<&Path>, rc_files: &[&str]) -> String {
+    let Some(home) = home else {
         return format!("{CHECK}no home directory");
     };
-    if !path.is_file() {
-        return format!("{CROSS}not found: {} (soft — skipped)", path.display());
+    let candidates: Vec<PathBuf> = rc_files.iter().map(|f| home.join(f)).collect();
+    let existing: Vec<&PathBuf> = candidates.iter().filter(|p| p.is_file()).collect();
+
+    if existing.is_empty() {
+        let listed = candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{CROSS}not found: {listed} (soft — skipped)");
     }
-    let source = std::fs::read_to_string(path).unwrap_or_default();
-    let sourced = source.lines().any(|line| {
-        line.contains("hs init") || line.contains("hooks/bash.sh") || line.contains("hooks/zsh.sh")
-    });
-    if sourced {
-        format!("{CHECK}hook sourced in {}", path.display())
-    } else {
-        format!(
-            "{CROSS}no `hs init` hook found in {} (soft — skipped)",
-            path.display()
-        )
+
+    for path in &existing {
+        let source = std::fs::read_to_string(*path).unwrap_or_default();
+        let sourced = source.lines().any(|line| {
+            line.contains("hs init")
+                || line.contains("hooks/bash.sh")
+                || line.contains("hooks/zsh.sh")
+        });
+        if sourced {
+            return format!("{CHECK}hook sourced in {}", path.display());
+        }
     }
+
+    let listed = existing
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{CROSS}no `hs init` hook found in {listed} (soft — skipped)")
 }
 
 /// `1234567` → `1,234,567`.
@@ -198,6 +222,52 @@ mod tests {
         assert_eq!(human_size(1024), "1 KB");
         assert_eq!(human_size(420 * 1024), "420 KB");
         assert_eq!(human_size(4_200_000), "4.0 MB");
+    }
+
+    #[test]
+    fn hook_status_prefers_primary_rc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bashrc = tmp.path().join(".bashrc");
+        let bash_profile = tmp.path().join(".bash_profile");
+        std::fs::write(&bashrc, "eval \"$(hs init bash)\"").unwrap();
+        std::fs::write(&bash_profile, "eval \"$(hs init bash)\"").unwrap();
+        let result = hook_status(Some(tmp.path()), &[".bashrc", ".bash_profile"]);
+        assert!(
+            result.starts_with(CHECK),
+            "primary .bashrc must satisfy the check"
+        );
+        assert!(
+            result.contains(".bashrc"),
+            "primary path must be named, got: {result}"
+        );
+    }
+
+    #[test]
+    fn hook_status_falls_back_to_login_rc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bash_profile = tmp.path().join(".bash_profile");
+        std::fs::write(&bash_profile, "eval \"$(hs init bash)\"").unwrap();
+        // .bashrc intentionally absent — simulates a macOS login shell.
+        let result = hook_status(Some(tmp.path()), &[".bashrc", ".bash_profile"]);
+        assert!(
+            result.starts_with(CHECK),
+            "login-shell .bash_profile must satisfy the check"
+        );
+        assert!(
+            result.contains(".bash_profile"),
+            "fallback path must be named, got: {result}"
+        );
+    }
+
+    #[test]
+    fn hook_status_lists_all_missing_rc_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = hook_status(Some(tmp.path()), &[".bashrc", ".bash_profile"]);
+        assert!(result.starts_with(CROSS), "missing files must report cross");
+        assert!(
+            result.contains(".bashrc") && result.contains(".bash_profile"),
+            "both candidates must appear in the missing report: {result}"
+        );
     }
 
     #[test]

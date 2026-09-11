@@ -1,5 +1,7 @@
 # hs — Local context-aware command memory for developers and DevOps
 
+![hs demo](demo.gif)
+
 Standard shell history can only answer *"What did I type?"*. **hs** answers *"What worked here before?"*.
 
 hs captures every command you run, then ranks it with context: which project it ran in, whether it succeeded, how often it succeeds, and how recently. Instead of a flat list of raw lines, you get a ranked, filterable memory of the commands that actually work — tailored to the directory you're standing in.
@@ -262,8 +264,8 @@ $ hs doctor
 [✓] Journal mode: wal
 [✓] Integrity check: ok
 [✓] 5 unique commands · 5 executions · 56 KB on disk
-[✗] no hs init hook found in ~/.bashrc (soft — skipped)
-[✗] no hs init hook found in ~/.zshrc  (soft — skipped)
+[✗] not found: ~/.bashrc, ~/.bash_profile (soft — skipped)
+[✗] not found: ~/.zshrc, ~/.zprofile (soft — skipped)
 
 hs doctor: everything looks good.
 ```
@@ -288,7 +290,7 @@ The database lives at `~/Library/Application Support/hs/hs.db` on macOS (`$XDG_D
 
 ```sh
 cargo build            # dev build
-cargo test             # 124 tests
+cargo test             # 144 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
