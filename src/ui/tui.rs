@@ -115,14 +115,22 @@ fn event_loop(
 }
 
 /// Wrap-around, header-skipping row navigation.
+///
+/// The initial jump uses `delta` (so `PageDown` = +10, `PageUp` = -10,
+/// wrap-around from `End` etc.), but once the landing is on a
+/// `Row::Header` slot the collision-resolution loop advances one position
+/// at a time (`delta.signum()`) instead of re-applying the full jump —
+/// otherwise a page jump that lands on a header would leap again by 10,
+/// skipping visible commands or even moving backwards.
 fn next_row(slots: &[Option<usize>], current: Option<usize>, delta: i32) -> usize {
     let n = slots.len();
     if n == 0 || !slots.iter().any(Option::is_some) {
         return 0;
     }
     let mut next = (current.unwrap_or(0) as i64 + delta as i64).rem_euclid(n as i64) as usize;
+    let step = delta.signum() as i64;
     while slots[next].is_none() {
-        next = (next as i64 + delta as i64).rem_euclid(n as i64) as usize;
+        next = (next as i64 + step).rem_euclid(n as i64) as usize;
     }
     next
 }
@@ -308,6 +316,23 @@ mod tests {
     fn next_row_handles_empty_and_all_headers() {
         assert_eq!(next_row(&[], Some(0), 1), 0);
         assert_eq!(next_row(&[None, None], None, 1), 0);
+    }
+
+    #[test]
+    fn next_row_page_jump_resolves_headers_by_single_steps() {
+        // Array of 20 slots. Index 11 is a header.
+        let mut slots = vec![Some(0); 20];
+        slots[11] = None;
+
+        // Start at index 1. Jump by 10 (PageDown).
+        // Initial jump lands on 11 (the header).
+        // It should step by +1 to index 12, NOT jump by 10 again to 21%20=1.
+        assert_eq!(next_row(&slots, Some(1), 10), 12);
+
+        // Start at index 1. Jump by -10 (PageUp).
+        // Initial jump lands on -9 % 20 = 11 (the header).
+        // It should step by -1 to index 10, NOT jump by -10 again.
+        assert_eq!(next_row(&slots, Some(1), -10), 10);
     }
 
     #[test]
