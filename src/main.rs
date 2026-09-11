@@ -110,18 +110,37 @@ fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
     let store = db::repository::Store::new(pool.clone());
 
     // Establish the "current project" context for soft boost + grouping.
-    let cwd = std::env::current_dir()?;
-    let current_project_id = context::find_project_root(&cwd)
+    // Discovery of the git root is decoupled from its database id: a
+    // brand-new repo has a `.git` but no recorded commands yet, so the id
+    // lookup legitimately returns `None` while the repo itself exists.
+    //
+    // The cwd is taken from `$PWD` when available because that is the
+    // *logical* path the shell hooks pass to `capture --cwd`. `current_dir`
+    // (getcwd) can return a *physical* path when a symlink sits between the
+    // shell and the working directory (e.g. macOS `/var` → `/private/var`),
+    // which would disagree with the stored project path and silently break
+    // project scoping.
+    let cwd = std::env::var("PWD")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"))
+        });
+    let project_root = context::find_project_root(&cwd);
+    let current_project_id = project_root
         .as_deref()
         .and_then(|root| root.to_str())
         .and_then(|path| store.get_project_id_by_path(path).ok())
         .flatten();
 
     // `--project` is an explicit request to scope results to *this* git
-    // repository. Outside a repo there is nothing to scope to — fail
-    // loudly instead of silently degrading to a `--global` search.
-    if let Some(msg) = project_scope_mismatch(cli.project, current_project_id) {
-        eprintln!("{msg}");
+    // repository. It requires a resolvable git root: when `project_root`
+    // is `None` we are outside any repo and there is nothing to scope to.
+    // (When the root exists but is not in the DB yet, the search proceeds
+    // and simply finds no commands — see `fetch_candidates`.)
+    if cli.project && project_root.is_none() {
+        eprintln!("hs: --project flag requires being inside a git repository");
         return Ok(1);
     }
 
@@ -176,22 +195,6 @@ fn execute_and_record(pool: &DbPool, cmd: &str, cwd: &Path) -> Result<i32, HsErr
     }
 
     Ok(exit_code)
-}
-
-/// Decode why `--project` cannot be honored for the current directory.
-///
-/// Returns the user-facing message when an explicit `--project` request
-/// could not resolve to a git project (i.e. we're outside any repo), and
-/// `None` when the search may proceed as normal.
-fn project_scope_mismatch(
-    cli_project: bool,
-    current_project_id: Option<i64>,
-) -> Option<&'static str> {
-    if cli_project && current_project_id.is_none() {
-        Some("hs: --project flag requires being inside a git repository")
-    } else {
-        None
-    }
 }
 
 /// Decide whether to launch the interactive TUI or print a table.
@@ -348,19 +351,6 @@ mod tests {
         // Non-terminal (pipe/script) honors --print → table.
         assert!(!should_launch_tui(false, false));
         assert!(!should_launch_tui(true, false));
-    }
-
-    #[test]
-    fn project_scope_mismatch_flags_missing_repo() {
-        // Outside a git repo, `--project` must refuse to search globally.
-        let msg = project_scope_mismatch(true, None).unwrap();
-        assert!(msg.contains("--project"));
-        assert!(msg.contains("git repository"));
-
-        // Inside a repo (or without --project) the guard stays silent.
-        assert_eq!(project_scope_mismatch(false, None), None);
-        assert_eq!(project_scope_mismatch(true, Some(7)), None);
-        assert_eq!(project_scope_mismatch(false, Some(7)), None);
     }
 
     #[test]

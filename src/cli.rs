@@ -291,7 +291,11 @@ pub enum Commands {
     #[command(hide = true)]
     Capture {
         /// The command string that was executed.
-        #[arg(long, value_name = "STRING")]
+        ///
+        /// `allow_hyphen_values` lets commands that *start* with `-`
+        /// (e.g. `-ls` or `rm -rf`) arrive intact — clap would otherwise
+        /// reject the value as an unknown flag before the hook can fire.
+        #[arg(long, value_name = "STRING", allow_hyphen_values = true)]
         cmd: String,
 
         /// The working directory of the shell at execution time.
@@ -675,6 +679,20 @@ mod tests {
                 assert_eq!(cwd, "/tmp");
                 assert_eq!(exit, 0);
                 assert_eq!(duration_ms, 0);
+            }
+            _ => panic!("expected Capture"),
+        }
+    }
+
+    #[test]
+    fn capture_accepts_hyphenated_command() {
+        // Commands starting with `-` (e.g. `-ls`) must not be swallowed
+        // by clap as an unknown option.
+        let cli = Cli::try_parse_from(["hs", "capture", "--cmd", "-ls", "--cwd", "/tmp"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Capture { cmd, cwd, .. } => {
+                assert_eq!(cmd, "-ls");
+                assert_eq!(cwd, "/tmp");
             }
             _ => panic!("expected Capture"),
         }

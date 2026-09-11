@@ -232,11 +232,17 @@ impl Store {
         }
 
         // Hard project filter (only active in non-global mode).
-        if !ctx.global
-            && let Some(project_id) = ctx.current_project_id
-        {
-            wheres.push("c.project_id = ?".to_string());
-            values.push(Value::from(project_id));
+        if !ctx.global {
+            if let Some(project_id) = ctx.current_project_id {
+                wheres.push("c.project_id = ?".to_string());
+                values.push(Value::from(project_id));
+            } else {
+                // `--project` was requested but this repo has no recorded
+                // commands yet (`.git` exists, the `projects` table does
+                // not). The only correct answer is "nothing matches" —
+                // never silently widen to a global search.
+                wheres.push("1 = 0".to_string());
+            }
         }
 
         // Outcome filters.
@@ -425,8 +431,13 @@ fn upsert_command(
     if let Some(id) = command_id_for(conn, cmd_hash, project_id)? {
         return Ok(id);
     }
+    // `INSERT OR IGNORE`: two hooks can race on the very first insert of a
+    // command (e.g. a precmd that fires before the previous command's
+    // capture finishes). Without it, one of them dies on the UNIQUE
+    // index and the capture is silently dropped while aborting the
+    // surrounding transaction.
     conn.execute(
-        "INSERT INTO commands (project_id, cmd_hash, cmd_string)
+        "INSERT OR IGNORE INTO commands (project_id, cmd_hash, cmd_string)
          VALUES (?1, ?2, ?3)",
         params![project_id, cmd_hash, cmd_string],
     )?;
