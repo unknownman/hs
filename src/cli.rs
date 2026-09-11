@@ -51,8 +51,16 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     /// Search query. Omit to launch the interactive TUI.
+    ///
+    /// A query acts as a **pre-filter** for the TUI (or, with `--print`,
+    /// for the ranked table). Hyphen-prefixed words like `--force` are
+    /// accepted as part of the query instead of being rejected as unknown
+    /// flags. TRADEOFF: clap's `allow_hyphen_values` collects *all*
+    /// post-query tokens into the query, so real flags typed after the
+    /// query (`hs deploy --print`) are restored by
+    /// [`Cli::normalize_embedded_flags`].
     #[arg(
-        trailing_var_arg = true,
+        allow_hyphen_values = true,
         help = "Words to search for in command history (omit to launch TUI)"
     )]
     pub query: Option<Vec<String>>,
@@ -125,6 +133,75 @@ pub struct Cli {
     // ── Subcommands ────────────────────────────────────────────────
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+impl Cli {
+    /// Restore real flags the user typed *after* the first query word
+    /// (e.g. `hs deploy --print`, `hs docker --last 1d`).
+    ///
+    /// clap's `allow_hyphen_values` means query words may start with `-`
+    /// (`hs --force` searches for `--force`), but as a side effect every
+    /// token after the query is collected into the query — so `--print`
+    /// would otherwise be swallowed. This hoists the recognised flags back
+    /// into their dedicated fields (`--last` together with its value);
+    /// unknown hyphen words (like `--force`) stay in the query. An
+    /// empty or all-whitespace query is normalized to `None`. Called right
+    /// after [`Parser::parse`].
+    pub fn normalize_embedded_flags(&mut self) {
+        let Some(query) = self.query.as_mut() else {
+            return;
+        };
+
+        let mut i = 0;
+        while i < query.len() {
+            let hoisted = match query[i].as_str() {
+                "--print" => {
+                    self.print = true;
+                    true
+                }
+                "--ok" => {
+                    self.ok = true;
+                    true
+                }
+                "--failed" => {
+                    self.failed = true;
+                    true
+                }
+                "--project" => {
+                    self.project = true;
+                    true
+                }
+                "--global" => {
+                    self.global = true;
+                    true
+                }
+                // `--last WINDOW` consumes the flag *and* its value.
+                "--last" if i + 1 < query.len() => {
+                    self.last = Some(query[i + 1].clone());
+                    query.remove(i + 1);
+                    true
+                }
+                "--last" => false,
+                _ => false,
+            };
+            if hoisted {
+                query.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+
+        // An all-empty/whitespace query is equivalent to no query at all
+        // (`hs docker --print` or `hs "   "`): normalize to `None` so the
+        // caller never hands a zero-match `WHERE 1 = 0` to the FTS engine.
+        if self
+            .query
+            .as_ref()
+            .is_some_and(|words| words.is_empty() || words.iter().all(|w| w.trim().is_empty()))
+        {
+            self.query = None;
+        }
+    }
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -271,6 +348,93 @@ mod tests {
     }
 
     #[test]
+    fn query_allows_hyphen_prefixed_flags() {
+        // `hs --force` must parse `--force` as the query, not die with an
+        // unknown-flag error.
+        let cli = Cli::try_parse_from(["hs", "--force"]).unwrap();
+        assert_eq!(cli.query, Some(vec!["--force".to_string()]));
+        assert!(!cli.print, "--print must remain a real flag");
+    }
+
+    #[test]
+    fn flags_after_the_query_are_normalized() {
+        // `hs deploy --print` → the trailing `--print` must be restored
+        // as the print flag while `deploy` stays the query.
+        let mut cli = Cli::try_parse_from(["hs", "deploy", "--print"]).unwrap();
+        cli.normalize_embedded_flags();
+        assert!(cli.print, "--print after the query must still be a flag");
+        assert_eq!(cli.query, Some(vec!["deploy".to_string()]));
+
+        // Outcome/scope flags typed after the query are hoisted too.
+        let mut cli = Cli::try_parse_from(["hs", "docker", "build", "--ok", "--project"]).unwrap();
+        cli.normalize_embedded_flags();
+        assert!(cli.ok);
+        assert!(cli.project);
+        assert_eq!(
+            cli.query,
+            Some(vec!["docker".to_string(), "build".to_string()])
+        );
+
+        // Unknown hyphen words survive the normalization.
+        let mut cli = Cli::try_parse_from(["hs", "rm", "-rf", "--force"]).unwrap();
+        cli.normalize_embedded_flags();
+        assert_eq!(
+            cli.query,
+            Some(vec![
+                "rm".to_string(),
+                "-rf".to_string(),
+                "--force".to_string()
+            ])
+        );
+
+        // Flags before the query are parsed natively and untouched.
+        let mut cli = Cli::try_parse_from(["hs", "--print", "docker", "--force"]).unwrap();
+        cli.normalize_embedded_flags();
+        assert!(cli.print);
+        assert_eq!(
+            cli.query,
+            Some(vec!["docker".to_string(), "--force".to_string()])
+        );
+    }
+
+    #[test]
+    fn flags_after_the_query_with_values_are_normalized() {
+        // `hs docker --last 1d` → `--last` *and* its value must be
+        // restored as the time window, leaving `docker` as the query.
+        let mut cli = Cli::try_parse_from(["hs", "docker", "--last", "1d"]).unwrap();
+        cli.normalize_embedded_flags();
+        assert_eq!(cli.last.as_deref(), Some("1d"));
+        assert_eq!(cli.query, Some(vec!["docker".to_string()]));
+
+        // A trailing `--last` with no value stays in the query.
+        let mut cli = Cli::try_parse_from(["hs", "docker", "--last"]).unwrap();
+        cli.normalize_embedded_flags();
+        assert_eq!(cli.last, None);
+        assert_eq!(
+            cli.query,
+            Some(vec!["docker".to_string(), "--last".to_string()])
+        );
+    }
+
+    #[test]
+    fn empty_or_whitespace_queries_normalize_to_none() {
+        // `hs "   "` — an all-whitespace query — must become `None`
+        // instead of a zero-match FTS query.
+        let mut cli = Cli::try_parse_from(["hs", "   "]).unwrap();
+        assert_eq!(cli.query, Some(vec!["   ".to_string()]));
+        cli.normalize_embedded_flags();
+        assert_eq!(cli.query, None);
+
+        // `hs --print` with no query words is trivially `None` from
+        // clap; normalize must not break it.
+        let mut cli = Cli::try_parse_from(["hs", "--print"]).unwrap();
+        assert!(cli.print);
+        assert_eq!(cli.query, None);
+        cli.normalize_embedded_flags();
+        assert_eq!(cli.query, None);
+    }
+
+    #[test]
     fn project_global_conflict() {
         let result = Cli::try_parse_from(["hs", "--project", "--global", "build"]);
         assert!(result.is_err(), "--project and --global must conflict");
@@ -296,12 +460,30 @@ mod tests {
     }
 
     #[test]
-    fn tag_flag_is_rejected() {
-        let result = Cli::try_parse_from(["hs", "-t", "cargo", "build"]);
-        assert!(result.is_err(), "removed -t/--tag must be rejected");
-
-        let result = Cli::try_parse_from(["hs", "--tag", "docker", "build"]);
-        assert!(result.is_err(), "removed --tag must be rejected");
+    fn removed_tag_flag_is_swallowed_into_query() {
+        // `-t`/`--tag` were removed as flags. With `allow_hyphen_values`
+        // the words are no longer hard errors — they join the query, so
+        // searching for a literal flag like `--force` keeps working.
+        let cli = Cli::try_parse_from(["hs", "-t", "cargo", "build"]).unwrap();
+        assert_eq!(
+            cli.query,
+            Some(vec![
+                "-t".to_string(),
+                "cargo".to_string(),
+                "build".to_string()
+            ])
+        );
+        // A known flag still parses as a flag when it appears first.
+        let cli = Cli::try_parse_from(["hs", "--tag", "docker", "build"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(
+            cli.query,
+            Some(vec![
+                "--tag".to_string(),
+                "docker".to_string(),
+                "build".to_string()
+            ])
+        );
     }
 
     #[test]

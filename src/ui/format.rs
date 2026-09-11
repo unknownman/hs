@@ -9,7 +9,7 @@ use std::io::{self, IsTerminal as _};
 
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
 use comfy_table::presets::UTF8_FULL;
-use comfy_table::{Cell, Color, Table};
+use comfy_table::{Cell, CellAlignment, Color, Table};
 
 use crate::models::PinnedCommand;
 use crate::ranking::RankedCommand;
@@ -67,10 +67,11 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
                 "{pin_marker}{}",
                 ellipsize(&r.cmd_string, MAX_DISPLAY_CHARS)
             )),
-            Cell::new(format!("{:.2}", r.final_score)),
-            Cell::new(total),
-            Cell::new(success_rate),
-            Cell::new(short_date(r.last_executed_at.as_deref())),
+            Cell::new(format!("{:.2}", r.final_score)).set_alignment(CellAlignment::Right),
+            Cell::new(total).set_alignment(CellAlignment::Right),
+            Cell::new(success_rate).set_alignment(CellAlignment::Right),
+            Cell::new(short_date(r.last_executed_at.as_deref()))
+                .set_alignment(CellAlignment::Right),
         ];
 
         let cells = if colored {

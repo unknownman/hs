@@ -72,7 +72,11 @@ You can also point at a specific file: `hs import ~/.local/share/history`.
 
 ### Interactive recall
 
-Run `hs` with no arguments to open the interactive browser. It lists ranked results in two sections — **`Current project`** and **`Global / other`** — with a preview panel showing the full command, its run statistics, and a live risk classification badge.
+Run `hs` — with **no arguments** for a full browse, or with a **query**
+(e.g. `hs deploy`) to open the same browser already narrowed to matching
+commands. It lists ranked results in two sections — **`Current project`**
+and **`Global / other`** — with a preview panel showing the full command,
+its run statistics, and a live risk classification badge.
 
 ```
 ┌ hs — What worked here before? ─────────────┐
@@ -94,9 +98,10 @@ Run `hs` with no arguments to open the interactive browser. It lists ranked resu
 
 ### Targeted CLI queries
 
-hs doubles as a fast, scriptable query tool. Any query returns immediately as
-a ranked table — the TUI is reserved for `hs` with no arguments on a real
-terminal.
+A query is a **pre-filter for the TUI**, not a read-only shortcut: `hs deploy`
+opens the interactive browser already narrowed to deploy commands — hit
+`Enter` to re-run one (safely), `Esc` to back out. The scenario filters
+below still combine with a query to narrow the candidate set.
 
 | Scenario | Command |
 |---|---|
@@ -104,6 +109,10 @@ terminal.
 | **DevOps** — failed container runs, last 24 h | `hs --failed --last 1d docker` |
 | **Scripting** — formatted table for pipes/logs | `hs --print build` |
 | **Keepers** — pin a command you re-run constantly | `hs pin <ID>` |
+
+When you specifically want the **read-only** ranked table — piping it to
+`less`, saving to a file, or feeding a script — pass `--print`. It prints
+the table and exits without opening the TUI.
 
 ### Pinned commands
 
@@ -125,9 +134,9 @@ also deletes its pin. An empty pin list prints `No pinned commands.`
 ╭────┬─────────────────────────────┬───────┬──────┬─────────┬──────────────────╮
 │ #  ┆ Command                     ┆ Score ┆ Runs ┆ Success ┆ Last Run         │
 ╞════╪═════════════════════════════╪═══════╪══════╪═════════╪══════════════════╡
-│ →1 ┆ echo hello-from-hs-project  ┆ 1.17  ┆ 1    ┆ 100%    ┆ 2026-09-09 15:10 │
-├╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
-│  2 ┆ echo global-universal-hello ┆ 0.64  ┆ 1    ┆ 100%    ┆ 2026-09-09 15:10 │
+│ →1 ┆ echo hello-from-hs-project  ┆  1.17 ┆    1 ┆    100% ┆ 2026-09-09 15:10 │
+├╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┤
+│  2 ┆ echo global-universal-hello ┆  0.64 ┆    1 ┆    100% ┆ 2026-09-09 15:10 │
 ╰────┴─────────────────────────────┴───────┴──────┴─────────┴──────────────────╯
 → commands from the current project
 ```
@@ -141,16 +150,20 @@ also deletes its pin. An empty pin list prints `No pinned commands.`
 | `--ok` | Only successful commands (exit code 0). Mutual with `--failed`. |
 | `--failed` | Only failed commands (exit code > 0). Use for debugging "why did this break". |
 | `--last <WINDOW>` | Time window: `30m`, `1h`, `2d`, `1w`. |
-| `--print` | Print a table and exit instead of opening the TUI (useful on a TTY; a query already forces the table). |
+| `--print` | Print the read-only ranked table and exit instead of opening the TUI (for piping/scripting). |
 
-### Search never executes
+### When does hs run a command?
 
-Searching is strictly a read operation: `hs <query>` renders a ranked table
-and exits `0`. hs deliberately does **not** auto-execute a single exact
-match — the only way a command runs is an explicit `Enter` in the
-interactive TUI (through the [execution guard](#execution-guard)). To
-re-run a command, launch the TUI with `hs`, select the row, and press
-`Enter`.
+Never automatically. A query (`hs deploy`) merely *pre-filters* the
+interactive TUI; the only way a recorded command actually runs is an
+explicit `Enter` in that TUI, routed through the
+[execution guard](#execution-guard). A search can therefore end in a
+re-run — but only because *you* pressed Enter and confirmed it.
+
+When you want read-only output — piping into `less`, saving to a file, or
+feeding a script — use `--print` (piping stdout to a non-TTY is
+equivalent). `hs --print deploy` prints a ranked table and exits without
+opening the TUI.
 
 ### Exit codes
 
@@ -267,7 +280,7 @@ The database lives at `~/Library/Application Support/hs/hs.db` on macOS (`$XDG_D
 
 ```sh
 cargo build            # dev build
-cargo test             # 117 tests
+cargo test             # 124 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```

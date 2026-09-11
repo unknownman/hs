@@ -32,7 +32,8 @@ fn main() {
         )
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.normalize_embedded_flags();
 
     let code = match run(cli) {
         Ok(code) => code,
@@ -96,10 +97,10 @@ fn run(cli: Cli) -> Result<i32, HsError> {
 ///
 /// Branching:
 /// * zero results → quiet message, exit 0.
-/// * `hs <query>` (any query), `--print`, or non-TTY stdout → ranked
-///   table, exit 0.
-/// * `hs` with no query on a TTY → interactive TUI; `Enter` runs the
-///   selected command (guarded), `Esc`/`Ctrl-C` exits without running.
+/// * `--print` or non-TTY stdout → ranked table, exit 0.
+/// * terminal (with or without a query) → interactive TUI. A query
+///   pre-filters the candidate list; `Enter` runs the selected command
+///   (guarded), `Esc`/`Ctrl-C` exits without running.
 fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
     let pool = get_pool()?;
     let store = db::repository::Store::new(pool.clone());
@@ -134,11 +135,7 @@ fn cmd_search_and_exec(cli: &Cli) -> Result<i32, HsError> {
         return Ok(0);
     }
 
-    if !should_launch_tui(
-        cli.query.is_some(),
-        cli.print,
-        std::io::stdout().is_terminal(),
-    ) {
+    if !should_launch_tui(cli.print, std::io::stdout().is_terminal()) {
         ui::format::print_results_table(&ranked, current_project_id);
         return Ok(0);
     }
@@ -172,10 +169,11 @@ fn execute_and_record(pool: &DbPool, cmd: &str, cwd: &Path) -> Result<i32, HsErr
 /// Decide whether to launch the interactive TUI or print a table.
 ///
 /// The TUI is the *only* surface that can run a command (via explicit
-/// `Enter`), and it only makes sense as the default action with no
-/// query on a real terminal.
-fn should_launch_tui(query_present: bool, print: bool, is_terminal: bool) -> bool {
-    !query_present && !print && is_terminal
+/// `Enter`). It launches on a real terminal whenever `--print` is absent —
+/// a query merely pre-filters which commands populate it. `--print` (or a
+/// non-terminal stdout) forces the ranked table instead.
+fn should_launch_tui(print: bool, is_terminal: bool) -> bool {
+    !print && is_terminal
 }
 
 /// Parse a `--last` window like `30m`, `1h`, `2d`, `1w` into a SQLite
@@ -286,25 +284,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn should_launch_tui_only_without_query_or_print_on_a_terminal() {
-        // `hs` on a TTY → TUI. Every other combination → table.
-        assert!(should_launch_tui(false, false, true));
-        assert!(
-            !should_launch_tui(true, false, true),
-            "query forces a table"
-        );
-        assert!(
-            !should_launch_tui(false, true, true),
-            "--print forces a table"
-        );
-        assert!(
-            !should_launch_tui(false, false, false),
-            "pipe forces a table"
-        );
-        assert!(!should_launch_tui(true, true, true));
-        assert!(!should_launch_tui(true, false, false));
-        assert!(!should_launch_tui(false, true, false));
-        assert!(!should_launch_tui(true, true, false));
+    fn should_launch_tui_when_terminal_and_not_print() {
+        // TTY without --print → TUI, query or not (the query pre-filters).
+        assert!(should_launch_tui(false, true));
+        // --print forces a table even on a real terminal.
+        assert!(!should_launch_tui(true, true));
+        // Non-terminal (pipe/script) honors --print → table.
+        assert!(!should_launch_tui(false, false));
+        assert!(!should_launch_tui(true, false));
     }
 
     #[test]

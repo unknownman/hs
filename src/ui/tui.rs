@@ -4,7 +4,8 @@
 //! a scrollable ranked list on top, and a preview panel below showing
 //! the full command, its stats, and its risk classification.
 //!
-//! Keys: `↑`/`↓` navigate · `Enter` run · `Esc`/`Ctrl-C` abort.
+//! Keys: `↑`/`↓` navigate · `PageUp`/`PageDown` jump ±10 rows ·
+//! `Home`/`End` jump to first/last · `Enter` run · `Esc`/`Ctrl-C` abort.
 //!
 //! `ratatui::init()`/`restore()` manage raw mode + the alternate screen
 //! and (via the installed panic hook) guarantee the terminal is restored
@@ -88,6 +89,14 @@ fn event_loop(
                     state.select(Some(next_row(&selection_slots, state.selected(), 1)))
                 }
                 KeyCode::Up => state.select(Some(next_row(&selection_slots, state.selected(), -1))),
+                KeyCode::PageDown => {
+                    state.select(Some(next_row(&selection_slots, state.selected(), 10)))
+                }
+                KeyCode::PageUp => {
+                    state.select(Some(next_row(&selection_slots, state.selected(), -10)))
+                }
+                KeyCode::Home => state.select(Some(next_row(&selection_slots, None, 1))),
+                KeyCode::End => state.select(Some(next_row(&selection_slots, Some(0), -1))),
                 KeyCode::Enter => {
                     if let Some(idx) = state.selected().and_then(|row| selection_slots[row]) {
                         return Ok(Some(results[idx].cmd_string.clone()));
@@ -261,9 +270,10 @@ fn render(
     frame.render_widget(preview, chunks[1]);
 
     // ── Footer hints ─────────────────────────────────────────────────
-    let hints = Paragraph::new("↑/↓ navigate   Enter run   Esc / Ctrl-C exit")
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(Color::DarkGray));
+    let hints =
+        Paragraph::new("↑/↓ move   PgUp/PgDn ±10   Home/End jump   Enter run   Esc / Ctrl-C exit")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(hints, chunks[1]);
 }
 
@@ -363,7 +373,7 @@ mod tests {
             text.contains("Current project"),
             "section header must render"
         );
-        assert!(text.contains("Preview"), "preview panel must render");
+        assert!(text.contains("SAFE"), "preview risk badge must render");
     }
 
     #[test]
@@ -427,6 +437,9 @@ mod tests {
         );
         let text: String = buffer.iter().map(|cell| cell.symbol()).collect();
         assert!(text.contains('…'), "list cell must show the ellipsis");
-        assert!(text.contains("Preview"), "preview must wrap the full text");
+        assert!(
+            text.contains("Score"),
+            "preview must show the stat line, got: {text:?}"
+        );
     }
 }

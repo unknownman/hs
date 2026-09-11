@@ -77,27 +77,39 @@ hs --last 30m echo
 
 Supported window specifiers: `30m`, `1h`, `2d`, `1w`.
 
-## 5. Interactive recall — project boost + success rate
+## 5. Interactive recall — a query opens the TUI, pre-filtered
+
+A query is a pre-filled filter for the interactive TUI, not a read-only
+table shortcut. Re-running the command you captured in step 2 is now a
+single command:
 
 ```sh
 hs "echo hs-demo-hello-world"
-# EXPECT: search is non-interactive and READ-ONLY — a ranked table with
-# the echo commands and their success badges. Nothing is executed.
-
-hs
-# EXPECT: the TUI opens. Your echo commands are at the top of the
-# "Current project" section (boosted because you're in a git repo) with a
-# 100% success badge on the successful one, and "HIGH RISK"/"SAFE" shown in
-# the preview panel.
-#   ↑/↓ navigate, Enter run, Esc/Ctrl-C exit.
-# Press ↑/↓ to browse, then Esc to return to the prompt.
+# EXPECT: the TUI opens directly on echo hs-demo-hello-world — pre-filtered,
+# with a 100% success badge — ready to be executed. The live preview panel
+# shows the command and its risk classification (SAFE).
+# Press Enter to run it through the execution guard:
+#   [hs] Running: echo hs-demo-hello-world
+#   hs-demo-hello-world
+# The TUI exits and execution stats are updated. Or press Esc/Ctrl-C to
+# return to the prompt without running anything.
 ```
 
-From the TUI you can also filter before opening:
+When you want the **read-only** ranked table instead — to pipe it into a
+file or a script — that is exactly what `--print` is for:
+
+```sh
+hs --print "echo hs-demo-hello-world"
+# EXPECT: a ranked table of the echo commands. Read-only: nothing is
+# executed, no TUI is opened.
+```
+
+The scenario filters still work as TUI pre-filters too:
 
 ```sh
 hs --project --ok echo
-# EXPECT: only successful echo commands from the current project.
+# EXPECT: the TUI opens showing only successful echo commands from the
+# current project.
 ```
 
 ## 6. The Execution Guard
