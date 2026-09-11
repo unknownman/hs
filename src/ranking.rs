@@ -361,9 +361,7 @@ mod tests {
             ranked[1].final_score
         );
         // Explicitly equal to the no-recency baseline.
-        assert!(
-            (ranked[0].final_score - score_of(&unknown, None)).abs() < 1e-9
-        );
+        assert!((ranked[0].final_score - score_of(&unknown, None)).abs() < 1e-9);
     }
 
     #[test]

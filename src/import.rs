@@ -50,7 +50,8 @@ pub fn run_import(store: &Store, explicit: Option<PathBuf>) -> Result<i32, HsErr
         return Ok(1);
     }
 
-    let contents = fs::read_to_string(&source)?;
+    let raw_bytes = fs::read(&source)?;
+    let contents = String::from_utf8_lossy(&raw_bytes).into_owned();
     let is_zsh = source
         .file_name()
         .map(|name| name.to_string_lossy().contains("zsh"))

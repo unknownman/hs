@@ -55,17 +55,18 @@ impl Store {
         duration_ms: i64,
         cwd: &str,
     ) -> Result<(), HsError> {
-        let conn = self.pool.get()?;
+        let mut conn = self.pool.get()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
         // 1. Resolve or create the project.
         let project_id: Option<i64> = match project_path {
             Some(path) => {
                 let hash = dir_hash(path);
-                conn.execute(
+                tx.execute(
                     "INSERT OR IGNORE INTO projects (dir_hash, path) VALUES (?1, ?2)",
                     params![hash, path],
                 )?;
-                let id: i64 = conn.query_row(
+                let id: i64 = tx.query_row(
                     "SELECT id FROM projects WHERE dir_hash = ?1",
                     params![hash],
                     |row| row.get(0),
@@ -84,15 +85,16 @@ impl Store {
         // the command is already known. This keeps both capture and bulk
         // import idempotent for project-less commands.
         let c_hash = cmd_hash(cmd_string);
-        let command_id = upsert_command(&conn, project_id, &c_hash, cmd_string)?;
+        let command_id = upsert_command(&tx, project_id, &c_hash, cmd_string)?;
 
         // 3. Insert the execution (triggers update command_stats).
-        conn.execute(
+        tx.execute(
             "INSERT INTO executions (command_id, exit_code, duration_ms, working_dir)
              VALUES (?1, ?2, ?3, ?4)",
             params![command_id, exit_code, duration_ms, cwd],
         )?;
 
+        tx.commit()?;
         Ok(())
     }
 
@@ -260,7 +262,15 @@ impl Store {
             sql.push_str(&wheres.join(" AND "));
         }
 
-        sql.push_str(" ORDER BY c.id LIMIT 500");
+        if ctx.query.is_some() {
+            // bm25() returns negative values for better matches; ascending
+            // sort places the most relevant text matches at the top.
+            sql.push_str(" ORDER BY bm LIMIT 500");
+        } else {
+            // No query: surface pinned commands and most recent history first
+            // so the Rust ranker receives the best candidates.
+            sql.push_str(" ORDER BY is_pinned DESC, s.last_executed_at DESC LIMIT 500");
+        }
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values.iter()), |row| {
@@ -1508,5 +1518,164 @@ mod tests {
         };
         let cands = store.fetch_candidates(&ctx_wide).unwrap();
         assert_eq!(cands.len(), 2, "both survive a 3-hour window");
+    }
+
+    /// No query: `fetch_candidates` must surface recent commands over
+    /// ancient ones (`ORDER BY s.last_executed_at DESC`), instead of the
+    /// old `ORDER BY c.id` which returned the 500 oldest commands.
+    #[test]
+    fn no_query_fetches_recent_over_old_commands() {
+        let store = test_store();
+
+        store
+            .insert_execution(Some("/proj"), "ancient command", 0, 10, "/proj")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "recent command", 0, 10, "/proj")
+            .unwrap();
+        let ancient_id = command_id(&store, "ancient command", Some("/proj"));
+        let recent_id = command_id(&store, "recent command", Some("/proj"));
+
+        // Backdate the *first-inserted* command so id order and recency
+        // order disagree: id says "ancient" = 1, recency says "recent" first.
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "UPDATE command_stats SET last_executed_at =
+                     '2020-01-01T00:00:00Z' WHERE command_id = ?1",
+                [ancient_id],
+            )
+            .unwrap();
+        }
+
+        let ctx = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: None,
+        };
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].command_id, recent_id,
+            "recent command must be fetched before the ancient one"
+        );
+        assert_eq!(candidates[1].command_id, ancient_id);
+    }
+
+    /// No query: pinned commands outrank unpinned ones regardless of how
+    /// stale they are (`ORDER BY is_pinned DESC`).
+    #[test]
+    fn no_query_pins_sort_first_even_when_stale() {
+        let store = test_store();
+
+        store
+            .insert_execution(Some("/proj"), "stale pin", 0, 10, "/proj")
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "fresh plain", 0, 10, "/proj")
+            .unwrap();
+        let pinned_id = command_id(&store, "stale pin", Some("/proj"));
+        let _fresh_id = command_id(&store, "fresh plain", Some("/proj"));
+
+        store.pin_command(pinned_id).unwrap();
+        {
+            let conn = store.pool.get().unwrap();
+            conn.execute(
+                "UPDATE command_stats SET last_executed_at =
+                     '2020-01-01T00:00:00Z' WHERE command_id = ?1",
+                [pinned_id],
+            )
+            .unwrap();
+        }
+
+        let ctx = SearchContext {
+            query: None,
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: None,
+        };
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates[0].is_pinned,
+            "pinned command must sort first despite being stale"
+        );
+        assert_eq!(candidates[0].command_id, pinned_id);
+        assert!(!candidates[1].is_pinned);
+    }
+
+    /// With a query, bm25 relevance — not `c.id` insertion order — drives
+    /// the candidate ordering. Commands are inserted worst-match-first so
+    /// the resulting order can only come from `ORDER BY bm`.
+    #[test]
+    fn query_ordering_is_driven_by_bm25_relevance() {
+        let store = test_store();
+
+        // Worst match (longest doc, "vim" diluted by noise) inserted FIRST,
+        // best match (shortest doc) inserted LAST.
+        store
+            .insert_execution(
+                Some("/proj"),
+                "vim ./README.md ./src/main.rs ./src/lib.rs ./src/util.rs \
+                 ./src/build.rs ./docs/design.md ./docs/guide.md ./docs/api.md",
+                0,
+                10,
+                "/proj",
+            )
+            .unwrap();
+        store
+            .insert_execution(
+                Some("/proj"),
+                "vim ./src/main.rs ./src/lib.rs",
+                0,
+                10,
+                "/proj",
+            )
+            .unwrap();
+        store
+            .insert_execution(Some("/proj"), "vim ./main.rs", 0, 10, "/proj")
+            .unwrap();
+
+        let best_id = command_id(&store, "vim ./main.rs", Some("/proj"));
+        let worst_id = command_id(
+            &store,
+            "vim ./README.md ./src/main.rs ./src/lib.rs ./src/util.rs \
+                 ./src/build.rs ./docs/design.md ./docs/guide.md ./docs/api.md",
+            Some("/proj"),
+        );
+
+        let ctx = SearchContext {
+            query: Some("vim".to_string()),
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: None,
+        };
+        let candidates = store.fetch_candidates(&ctx).unwrap();
+        assert_eq!(candidates.len(), 3);
+        assert!(
+            candidates.windows(2).all(|w| w[0].bm25 <= w[1].bm25),
+            "candidates must be sorted by ascending bm25 (better matches first)"
+        );
+        assert_eq!(
+            candidates[0].command_id, best_id,
+            "most relevant match must rank first"
+        );
+        assert_ne!(
+            candidates.last().unwrap().command_id,
+            best_id,
+            "best match must not trail the pack"
+        );
+        assert_eq!(
+            candidates.last().unwrap().command_id,
+            worst_id,
+            "diluted command must be the worst match"
+        );
     }
 }
