@@ -12,7 +12,6 @@
 //! even if rendering panics.
 
 use std::io;
-use std::time::Duration;
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -60,7 +59,7 @@ fn event_loop(
     results: &[RankedCommand],
     current_project_id: Option<i64>,
 ) -> Result<Option<String>, HsError> {
-    use crossterm::event::{Event, KeyCode, KeyModifiers, poll, read};
+    use crossterm::event::{Event, KeyCode, KeyModifiers, read};
 
     let rows = build_rows(results, current_project_id);
     let selection_slots = rows
@@ -74,17 +73,20 @@ fn event_loop(
     let mut state = ListState::default();
     state.select(Some(next_row(&selection_slots, None, 1)));
 
+    // No ticker: `hs` has no background clock or progress bar, so the loop
+    // blocks on `read()` instead of poll-spinning. The draw lands at the
+    // top so every returned/ignored event (keys, paste) and every
+    // `Event::Resize` naturally triggers a repaint with 0% idle CPU.
     loop {
         terminal.draw(|frame| {
             render(frame, results, current_project_id, &rows, &mut state);
         })?;
 
-        if !poll(Duration::from_millis(100))? {
-            continue;
-        }
-
-        match read()? {
-            Event::Key(key) => match key.code {
+        // The only event worth acting on is a key. Any other event —
+        // Resize, Paste, Focus — needs no handling of its own: the loop
+        // spins back to the top and repaints with the new geometry.
+        if let Event::Key(key) = read()? {
+            match key.code {
                 KeyCode::Down => {
                     state.select(Some(next_row(&selection_slots, state.selected(), 1)))
                 }
@@ -107,9 +109,7 @@ fn event_loop(
                     return Ok(None);
                 }
                 _ => {}
-            },
-            Event::Resize(_, _) | Event::Paste(_) | Event::FocusGained | Event::FocusLost => {}
-            _ => {}
+            }
         }
     }
 }

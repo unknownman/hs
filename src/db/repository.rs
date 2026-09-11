@@ -320,6 +320,21 @@ impl Store {
         Ok(())
     }
 
+    /// Permanently remove a command and everything attached to it.
+    ///
+    /// The privacy escape hatch: a leaked secret or a garbage typo can be
+    /// erased from history outright. Returns `true` when a row was
+    /// deleted, `false` when no command with that id exists.
+    ///
+    /// Deleting the `commands` row is all that is required: the schema's
+    /// `ON DELETE CASCADE` foreign keys remove the `executions`, pins and
+    /// stats, and the FTS5 triggers drop the search-index entry too.
+    pub fn delete_command(&self, command_id: i64) -> Result<bool, HsError> {
+        let conn = self.pool.get()?;
+        let deleted = conn.execute("DELETE FROM commands WHERE id = ?1", params![command_id])?;
+        Ok(deleted > 0)
+    }
+
     /// List every pinned command, newest pin first.
     ///
     /// Joins the pinned command's string and (when present) its project
@@ -775,6 +790,104 @@ mod tests {
         }
 
         assert!(store.list_pins().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_command_removes_row_executions_stats_pins_and_fts() {
+        let store = test_store();
+
+        // A command with history, a pin, a stats entry and an FTS row.
+        store
+            .insert_execution(None, "docker login registry.example.com", 0, 10, "/tmp")
+            .unwrap();
+        store
+            .insert_execution(None, "docker login registry.example.com", 1, 12, "/tmp")
+            .unwrap();
+        let id = command_id(&store, "docker login registry.example.com", None);
+        store.pin_command(id).unwrap();
+
+        // Sanity: the FTS index has the row before deletion.
+        {
+            let conn = store.pool.get().unwrap();
+            let fts_before: i32 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM commands_fts WHERE rowid = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(fts_before, 1, "FTS row must exist before deletion");
+        }
+
+        assert!(
+            store.delete_command(id).unwrap(),
+            "delete_command must report true for an existing id"
+        );
+
+        let conn = store.pool.get().unwrap();
+        let commands: i32 = conn
+            .query_row("SELECT COUNT(*) FROM commands WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(commands, 0, "command row must be gone");
+
+        let executions: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM executions WHERE command_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(executions, 0, "executions must cascade away");
+
+        let stats: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM command_stats WHERE command_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stats, 0, "command_stats must cascade away");
+
+        let pins: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pins WHERE command_id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pins, 0, "pins must cascade away");
+
+        let fts: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM commands_fts WHERE rowid = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts, 0, "FTS delete trigger must drop the search entry");
+        drop(conn);
+
+        // Deleting an already-absent id reports false, not an error.
+        assert!(
+            !store.delete_command(id).unwrap(),
+            "second delete of the same id must report false"
+        );
+
+        // And the command no longer surfaces in a search.
+        let ctx = SearchContext {
+            query: Some("docker login".to_string()),
+            current_project_id: None,
+            global: true,
+            ok_only: false,
+            failed_only: false,
+            time_window: None,
+        };
+        assert!(
+            store.fetch_candidates(&ctx).unwrap().is_empty(),
+            "deleted command must vanish from search results"
+        );
     }
 
     #[test]

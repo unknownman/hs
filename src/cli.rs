@@ -232,6 +232,19 @@ pub enum Commands {
         id: i64,
     },
 
+    /// Permanently remove a command and all of its executions.
+    ///
+    /// The privacy escape hatch: use it when a secret ever evades
+    /// redaction, or a useless typo pollutes your history. Deletes the
+    /// command row, cascading to its executions, stats, and pins, and
+    /// dropping it from search results. This cannot be undone. Alias: `rm`.
+    #[command(alias = "rm")]
+    Delete {
+        /// The numeric ID of the command to permanently delete (from `hs`
+        /// search results).
+        id: i64,
+    },
+
     /// List all currently pinned commands.
     ///
     /// Shows each pinned command's string, project, and pin timestamp.
@@ -382,13 +395,15 @@ mod tests {
             Some(vec!["docker".to_string(), "build".to_string()])
         );
 
-        // Unknown hyphen words survive the normalization.
-        let mut cli = Cli::try_parse_from(["hs", "rm", "-rf", "--force"]).unwrap();
+        // Unknown hyphen words survive the normalization. (`rm` is now a
+        // real subcommand alias, so a bare `hs rm ...` routes to
+        // `delete`; use another leading word to search for it.)
+        let mut cli = Cli::try_parse_from(["hs", "find", "-rf", "--force"]).unwrap();
         cli.normalize_embedded_flags();
         assert_eq!(
             cli.query,
             Some(vec![
-                "rm".to_string(),
+                "find".to_string(),
                 "-rf".to_string(),
                 "--force".to_string()
             ])
@@ -547,6 +562,30 @@ mod tests {
     fn parse_pins_subcommand() {
         let cli = Cli::try_parse_from(["hs", "pins"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Pins));
+    }
+
+    #[test]
+    fn parse_delete_subcommand() {
+        let cli = Cli::try_parse_from(["hs", "delete", "42"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Delete { id } => assert_eq!(id, 42),
+            _ => panic!("expected Delete"),
+        }
+    }
+
+    #[test]
+    fn parse_delete_rm_alias() {
+        let cli = Cli::try_parse_from(["hs", "rm", "42"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Delete { id } => assert_eq!(id, 42),
+            _ => panic!("expected Delete via the rm alias"),
+        }
+    }
+
+    #[test]
+    fn delete_requires_id() {
+        let result = Cli::try_parse_from(["hs", "delete"]);
+        assert!(result.is_err(), "delete must require a command id");
     }
 
     #[test]

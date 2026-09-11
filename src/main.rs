@@ -59,6 +59,10 @@ fn run(cli: Cli) -> Result<i32, HsError> {
             let pool = get_pool()?;
             return cmd_unpin(&pool, id);
         }
+        Some(Commands::Delete { id }) => {
+            let pool = get_pool()?;
+            return cmd_delete(&pool, id);
+        }
         Some(Commands::Pins) => {
             let pool = get_pool()?;
             return cmd_pins(&pool);
@@ -254,6 +258,25 @@ fn cmd_unpin(pool: &DbPool, id: i64) -> Result<i32, HsError> {
     store.unpin_command(id)?;
     println!("[hs] Unpinned command #{id}");
     Ok(0)
+}
+
+/// Permanently remove a command and all of its history.
+///
+/// The privacy escape hatch: deletes the command, its executions, stats,
+/// pins, and search-index entry. Reports an error and exits 1 when the
+/// id does not exist.
+fn cmd_delete(pool: &DbPool, id: i64) -> Result<i32, HsError> {
+    let store = db::repository::Store::new(pool.clone());
+    match store.delete_command(id)? {
+        true => {
+            println!("[hs] Deleted command #{id} and all of its history");
+            Ok(0)
+        }
+        false => {
+            eprintln!("[hs] No command with id #{id} found.");
+            Ok(1)
+        }
+    }
 }
 
 /// List every pinned command as a table (or a quiet empty message).

@@ -109,10 +109,18 @@ below still combine with a query to narrow the candidate set.
 | **DevOps** — failed container runs, last 24 h | `hs --failed --last 1d docker` |
 | **Scripting** — formatted table for pipes/logs | `hs --print build` |
 | **Keepers** — pin a command you re-run constantly | `hs pin <ID>` |
+| **Escape hatch** — permanently erase a leaked/typo command | `hs delete <ID>` |
 
 When you specifically want the **read-only** ranked table — piping it to
 `less`, saving to a file, or feeding a script — pass `--print`. It prints
 the table and exits without opening the TUI.
+
+Deleting is your **privacy escape hatch**: if a secret ever evades
+redaction, or a useless typo pollutes your history, remove it for good with
+`hs delete <ID>` (alias `hs rm <ID>`). This permanently deletes the
+command, its executions, its stats, and its pins, and drops it from all
+`hs` searches. It cannot be undone, so the id is taken from `hs` search
+results — double-check before you run it.
 
 ### Pinned commands
 

@@ -17,6 +17,11 @@ use crate::ranking::RankedCommand;
 /// Maximum characters for a command shown in the one-line table/list.
 pub const MAX_DISPLAY_CHARS: usize = 64;
 
+/// Maximum rows the non-interactive table prints. Recall is capped here
+/// (not in SQL) because ranking happens after fetch; the bottom notice
+/// tells the user how to narrow instead of scrolling forever.
+const MAX_PRINT_ROWS: usize = 50;
+
 /// Truncate `text` to at most `max_chars` display characters, appending
 /// `…` when cut. Never returns a string longer than `max_chars` — this is
 /// the guard against pathological 5,000-character commands exploding the
@@ -48,7 +53,7 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
         .apply_modifier(UTF8_ROUND_CORNERS)
         .set_header(["#", "Command", "Score", "Runs", "Success", "Last Run"]);
 
-    for (i, r) in results.iter().enumerate() {
+    for (i, r) in results.iter().take(MAX_PRINT_ROWS).enumerate() {
         let in_project = current_project_id.is_some() && r.project_id == current_project_id;
         let total = r.success_count + r.fail_count;
         let success_rate = if total == 0 {
@@ -92,6 +97,12 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
 
     println!("{table}");
 
+    // Recall is capped: tell the user how many rows were dropped and how
+    // to converge on them instead of printing an endless wall.
+    if let Some(notice) = truncation_notice(results.len()) {
+        println!("{notice}");
+    }
+
     let has_pinned = results.iter().any(|r| r.is_pinned);
     let has_current = results
         .iter()
@@ -115,6 +126,16 @@ pub fn print_results_table(results: &[RankedCommand], current_project_id: Option
     if !legend.is_empty() {
         println!("{}", legend.join("   "));
     }
+}
+
+/// `... and X more (...)`, iff more than [`MAX_PRINT_ROWS`] rows exist.
+fn truncation_notice(total: usize) -> Option<String> {
+    (total > MAX_PRINT_ROWS).then(|| {
+        format!(
+            "... and {} more (use a query to narrow results)",
+            total - MAX_PRINT_ROWS
+        )
+    })
 }
 
 /// Print the pinned-command list as a table, or a quiet message when empty.
@@ -183,6 +204,33 @@ mod tests {
     #[test]
     fn empty_results_prints_message_without_panicking() {
         print_results_table(&[], None);
+    }
+
+    #[test]
+    fn truncation_notice_reports_only_extra_rows() {
+        assert_eq!(truncation_notice(50), None);
+        assert_eq!(
+            truncation_notice(57),
+            Some("... and 7 more (use a query to narrow results)".to_string())
+        );
+    }
+
+    #[test]
+    fn table_caps_at_max_print_rows() {
+        let rows: Vec<RankedCommand> = (0..(MAX_PRINT_ROWS + 7) as i64)
+            .map(|id| RankedCommand {
+                command_id: id + 1,
+                cmd_string: format!("echo command {id}"),
+                project_id: None,
+                final_score: 1.0,
+                success_count: 1,
+                fail_count: 0,
+                last_executed_at: Some("2026-09-08T10:11:12Z".to_string()),
+                is_pinned: false,
+            })
+            .collect();
+        // Must not panic and must underfill (truncated) rather than exceed.
+        print_results_table(&rows, None);
     }
 
     #[test]
