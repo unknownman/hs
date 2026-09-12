@@ -1,5 +1,5 @@
 [package]
-name = "hs"
+name = "hs-cli"
 version = "1.0.0"
 edition = "2024"
 description = "A fast, private, project-aware shell history tool"
@@ -8,6 +8,12 @@ readme = "README.md"
 categories = ["command-line-utilities", "development-tools"]
 keywords = ["cli", "history", "shell", "sqlite"]
 repository = "https://github.com/unknownman/hs"
+
+# The crates.io package is `hs-cli` (the bare `hs` name is taken by an
+# unrelated 2020 placeholder); the installed binary is still `hs`.
+[[bin]]
+name = "hs"
+path = "src/main.rs"
 
 [dependencies]
 rusqlite = { version = "0.40", features = ["bundled", "chrono"] }

@@ -18,6 +18,15 @@ hs captures every command you run, then ranks it with context: which project it 
 
 ## Installation
 
+Published on crates.io as **`hs-cli`** (the bare `hs` name is taken by an
+unrelated placeholder) — the installed command is still `hs`:
+
+```sh
+cargo install hs-cli
+```
+
+Or build from source:
+
 ```sh
 cargo install --path .
 ```
@@ -290,7 +299,7 @@ The database lives at `~/Library/Application Support/hs/hs.db` on macOS (`$XDG_D
 
 ```sh
 cargo build            # dev build
-cargo test             # 144 tests
+cargo test             # 147 tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```

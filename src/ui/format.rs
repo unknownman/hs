@@ -26,11 +26,20 @@ const MAX_PRINT_ROWS: usize = 50;
 /// `…` when cut. Never returns a string longer than `max_chars` — this is
 /// the guard against pathological 5,000-character commands exploding the
 /// CLI table (and, via the TUI list, the terminal).
+///
+/// Multiline commands (commonly imported from zsh history) are flattened
+/// to a **single physical line before** truncation: `\r` collapses to a
+/// space and each `\n` becomes the visual ` ↵ ` marker, so no cell can
+/// ever wrap in the `comfy-table` / TUI-list layouts that share this fn.
 pub fn ellipsize(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        return text.to_string();
+    let flat = text
+        .replace("\r\n", " ↵ ")
+        .replace('\r', " ")
+        .replace('\n', " ↵ ");
+    if flat.chars().count() <= max_chars {
+        return flat;
     }
-    let cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    let cut: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{cut}…")
 }
 
@@ -259,6 +268,35 @@ mod tests {
         assert_eq!(ellipsize("1234567", 3), "12…");
         // Character-aware: never splits a multibyte char.
         assert_eq!(ellipsize("héllo wörld", 6), "héllo…");
+    }
+
+    #[test]
+    fn ellipsize_flattens_multiline_commands() {
+        // A zsh-imported multiline command must collapse onto one physical
+        // line: `\r` → space, `\n` → the ` ↵ ` marker.
+        let flat = ellipsize("deploy:\n  git push\n  make test", MAX_DISPLAY_CHARS);
+        assert!(
+            !flat.contains('\n') && !flat.contains('\r'),
+            "output must be a single physical line, got: {flat:?}"
+        );
+        assert!(
+            flat.contains(" ↵ "),
+            "newlines must become the ↵ marker, got: {flat:?}"
+        );
+
+        assert_eq!(ellipsize("a\r\nb", 10), "a ↵ b");
+        assert_eq!(ellipsize("a\nb", 10), "a ↵ b");
+        assert_eq!(ellipsize("a\rb", 10), "a b");
+    }
+
+    #[test]
+    fn ellipsize_flattens_before_truncating() {
+        // The ↵ markers eat into the character budget, but the hard cap
+        // still applies and the output stays one physical line.
+        let out = ellipsize("one\ntwo\nthree four five six", 20);
+        assert_eq!(out.chars().count(), 20, "budget must still hold");
+        assert!(out.ends_with('…'), "must truncate: {out:?}");
+        assert!(!out.contains('\n'), "must stay one line: {out:?}");
     }
 
     #[test]

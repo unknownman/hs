@@ -251,7 +251,7 @@ fn render(
                 RiskLevel::High => "HIGH RISK",
             };
 
-            let lines = vec![
+            let mut lines = vec![
                 ratatui::text::Line::from(format!(
                     "{}ID: {}  ·  Score {:.2}  ·  {} run(s)  ·  success rate {}  ·  last: {}",
                     if r.is_pinned { " 📌 PINNED  " } else { "" },
@@ -262,13 +262,20 @@ fn render(
                     r.last_executed_at.as_deref().unwrap_or("never"),
                 )),
                 ratatui::text::Line::from(""),
-                ratatui::text::Line::from(r.cmd_string.as_str()),
-                ratatui::text::Line::from(""),
-                ratatui::text::Line::from(ratatui::text::Span::styled(
-                    format!("  {risk_label}  "),
-                    Style::default().fg(Color::Black).bg(risk_color),
-                )),
             ];
+            // A ratatui `Line` cannot hold embedded newlines, so a
+            // multiline command (commonly imported from zsh history) is
+            // split here into one physical `Line` per segment — the
+            // Paragraph then renders the command across as many rows as
+            // it needs instead of emitting a literal `\n` glyph.
+            for segment in r.cmd_string.lines() {
+                lines.push(ratatui::text::Line::from(segment));
+            }
+            lines.push(ratatui::text::Line::from(""));
+            lines.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!("  {risk_label}  "),
+                Style::default().fg(Color::Black).bg(risk_color),
+            )));
             Paragraph::new(lines)
                 .block(Block::default().borders(Borders::ALL).title(" Preview "))
                 .wrap(Wrap { trim: true })
@@ -477,6 +484,40 @@ mod tests {
         assert!(
             text.contains("ID: 1"),
             "preview must expose the command id even for huge commands, got: {text:?}"
+        );
+    }
+
+    /// A multiline command (commonly imported from zsh history) must render
+    /// each segment as its own physical line in the preview panel instead
+    /// of being fed wholesale into a single `Line`.
+    #[test]
+    fn preview_renders_multiline_command_lines() {
+        use ratatui::backend::TestBackend;
+
+        let cmd = "echo first\necho second\necho third";
+        let results = vec![sample(cmd, Some(3))];
+        let rows = build_rows(&results, Some(3));
+        let mut state = ListState::default();
+        state.select(Some(1)); // select the (only) command row
+
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &results, Some(3), &rows, &mut state))
+            .unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("echo first"), "first segment must render");
+        assert!(text.contains("echo second"), "second segment must render");
+        assert!(text.contains("echo third"), "third segment must render");
+        assert!(
+            text.contains("ID: 1"),
+            "preview must keep its stat line, got: {text:?}"
         );
     }
 }
