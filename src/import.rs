@@ -115,6 +115,7 @@ fn parse_bash(contents: &str) -> Vec<ImportEntry> {
         entries.push(ImportEntry {
             cmd: line.to_string(),
             executed_at,
+            duration_ms: None,
         });
     }
 
@@ -127,7 +128,7 @@ fn parse_zsh(contents: &str) -> Vec<ImportEntry> {
     let mut open: Option<ImportEntry> = None;
 
     for line in contents.lines() {
-        if let Some((ts, body_offset)) = zsh_header(line) {
+        if let Some((ts, body_offset, elapsed_secs)) = zsh_header(line) {
             if let Some(e) = open.take()
                 && !e.cmd.trim().is_empty()
             {
@@ -136,6 +137,7 @@ fn parse_zsh(contents: &str) -> Vec<ImportEntry> {
             open = Some(ImportEntry {
                 cmd: line[body_offset..].to_string(),
                 executed_at: Some(ts),
+                duration_ms: elapsed_secs.map(|secs| secs * 1000),
             });
         } else if let Some(current) = open.as_mut() {
             current.cmd.push('\n');
@@ -146,6 +148,7 @@ fn parse_zsh(contents: &str) -> Vec<ImportEntry> {
             entries.push(ImportEntry {
                 cmd: line.to_string(),
                 executed_at: None,
+                duration_ms: None,
             });
         }
     }
@@ -160,20 +163,24 @@ fn parse_zsh(contents: &str) -> Vec<ImportEntry> {
 }
 
 /// Parse a zsh extended-history header of the form
-/// `: <unixtime>:<elapsed>;` (elapsed optional) and return the timestamp
-/// plus the byte offset just past the `;`.
-fn zsh_header(line: &str) -> Option<(DateTime<Utc>, usize)> {
+/// `: <unixtime>:<elapsed>;` (elapsed optional) and return the timestamp,
+/// the elapsed time **in seconds** (zsh records `$SECONDS`-style durations),
+/// plus the byte offset just past the `;`. A missing or malformed elapsed
+/// field yields `None`.
+fn zsh_header(line: &str) -> Option<(DateTime<Utc>, usize, Option<i64>)> {
     let rest = line.strip_prefix(':')?.trim_start();
     // Body begins after the first `;`.
     let semicolon = rest.find(';')?;
     let header = &rest[..semicolon];
-    let ts_str = header.split(':').next()?.trim();
+    let mut parts = header.split(':').map(str::trim);
+    let ts_str = parts.next()?;
     let ts: i64 = ts_str.parse().ok()?;
+    let elapsed_secs: Option<i64> = parts.next().and_then(|s| s.parse().ok());
     // Offset into the ORIGINAL line: ':' (1) + leading whitespace trimmed
     // from rest, + header length + ';'.
     let prefix_len = line.len() - rest.len();
     let body_offset = prefix_len + header.len() + 1;
-    DateTime::from_timestamp(ts, 0).map(|dt| (dt, body_offset))
+    DateTime::from_timestamp(ts, 0).map(|dt| (dt, body_offset, elapsed_secs))
 }
 
 #[cfg(test)]
@@ -182,16 +189,23 @@ mod tests {
 
     #[test]
     fn zsh_header_parses_with_and_without_elapsed() {
-        let (ts, off) = zsh_header(": 1641024000:7;echo hi").unwrap();
+        // Elapsed present: seconds are extracted (ms conversion is
+        // `parse_zsh`'s job).
+        let (ts, off, elapsed) = zsh_header(": 1641024000:7;echo hi").unwrap();
         assert_eq!(ts.timestamp(), 1641024000);
+        assert_eq!(elapsed, Some(7));
         assert_eq!(&": 1641024000:7;echo hi"[off..], "echo hi");
 
-        let (ts, off) = zsh_header(": 1641024000;bare").unwrap();
+        // Elapsed absent: header still parses with `None`.
+        let (ts, off, elapsed) = zsh_header(": 1641024000;bare").unwrap();
         assert_eq!(ts.timestamp(), 1641024000);
+        assert_eq!(elapsed, None);
         assert_eq!(&": 1641024000;bare"[off..], "bare");
 
         assert!(zsh_header("not a header").is_none());
         assert!(zsh_header(": abc;x").is_none());
+        // Non-numeric elapsed field is tolerated (treated as absent).
+        assert_eq!(zsh_header(": 1641024000:abc;x").unwrap().2, None);
     }
 
     #[test]
@@ -243,13 +257,17 @@ ls
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0].cmd, "echo first");
         assert_eq!(entries[0].executed_at.unwrap().timestamp(), 1641024000);
+        assert_eq!(entries[0].duration_ms, Some(3000));
         assert_eq!(entries[1].cmd, "npm install \\\nlodash --no-save");
         assert_eq!(entries[1].executed_at.unwrap().timestamp(), 1641024100);
+        assert_eq!(entries[1].duration_ms, Some(2000));
         // The secret is intentionally NOT redacted here — redaction is the
         // persistence layer's job (`Store::import_entries`). We only assert
         // the parser preserved the raw text.
         assert!(entries[2].cmd.contains(&key));
+        assert_eq!(entries[2].duration_ms, Some(0));
         assert_eq!(entries[3].cmd, "bare");
+        assert_eq!(entries[3].duration_ms, Some(1000));
     }
 
     /// Phase 8 acceptance test: end-to-end import from a mock

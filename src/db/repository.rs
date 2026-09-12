@@ -114,9 +114,11 @@ impl Store {
     /// earlier line in the same file) is counted as a duplicate and
     /// skipped entirely — making re-imports idempotent.
     ///
-    /// Legacy history has no exit/duration signals, so neutral defaults
-    /// (`exit_code = 0`, `duration_ms = 0`) are recorded, plus the
-    /// original timestamp when the source format provided one.
+    /// Legacy history has no exit-code signal, so a neutral default
+    /// (`exit_code = 0`) is recorded. Duration (in milliseconds) comes
+    /// from zsh's `<elapsed>` header field when present; otherwise a
+    /// neutral `0` is used. The original timestamp is recorded when the
+    /// source format provided one.
     pub fn import_entries(
         &self,
         entries: Vec<ImportEntry>,
@@ -130,7 +132,7 @@ impl Store {
         let report = {
             let mut insert_execution = tx.prepare(
                 "INSERT INTO executions (command_id, exit_code, duration_ms, working_dir, executed_at)
-                 VALUES (?1, 0, 0, ?2, ?3)",
+                 VALUES (?1, 0, ?4, ?2, ?3)",
             )?;
 
             let mut report = ImportReport {
@@ -160,7 +162,12 @@ impl Store {
                     .executed_at
                     .unwrap_or_else(Utc::now)
                     .to_rfc3339_opts(SecondsFormat::Secs, true);
-                insert_execution.execute(params![command_id, working_dir, executed_at])?;
+                insert_execution.execute(params![
+                    command_id,
+                    working_dir,
+                    executed_at,
+                    entry.duration_ms.unwrap_or(0),
+                ])?;
                 report.imported += 1;
             }
 
@@ -1246,16 +1253,19 @@ mod tests {
                 executed_at: ChDateTime::parse_from_rfc3339("2022-01-01T00:00:00Z")
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .ok(),
+                duration_ms: Some(1200),
             },
             crate::models::ImportEntry {
                 cmd: "npm install \\\nlodash".to_string(), // multiline zsh entry
                 executed_at: ChDateTime::parse_from_rfc3339("2022-06-15T12:30:00Z")
                     .map(|dt| dt.with_timezone(&chrono::Utc))
                     .ok(),
+                duration_ms: None,
             },
             crate::models::ImportEntry {
                 cmd: "echo no-timestamp".to_string(),
                 executed_at: None,
+                duration_ms: None,
             },
         ];
 
@@ -1264,13 +1274,13 @@ mod tests {
         assert_eq!(first.redacted, 1, "the API key command must be counted");
         assert_eq!(first.duplicates, 0);
 
-        let stored: Vec<(String, String)> = {
+        let stored: Vec<(String, String, i64)> = {
             // max_size(1) pool: hold the connection only inside this
             // scope so later `Store` calls can also borrow it.
             let conn = store.pool.get().expect("pool get failed");
             let mut stmt = conn
                 .prepare(
-                    "SELECT c.cmd_string, e.executed_at
+                    "SELECT c.cmd_string, e.executed_at, e.duration_ms
                      FROM commands c
                      JOIN executions e ON e.command_id = c.id
                      WHERE c.project_id IS NULL
@@ -1278,7 +1288,13 @@ mod tests {
                 )
                 .unwrap();
             let rows = stmt
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })
                 .unwrap();
             rows.filter_map(Result::ok).collect()
         };
@@ -1287,6 +1303,10 @@ mod tests {
         // Timestamps survive the round-trip (RFC3339 text form).
         assert_eq!(stored[0].1, "2022-01-01T00:00:00Z");
         assert_eq!(stored[1].1, "2022-06-15T12:30:00Z");
+        // The zsh elapsed field (seconds→ms) survives the round-trip.
+        assert_eq!(stored[0].2, 1200, "duration_ms must be persisted");
+        assert_eq!(stored[1].2, 0, "missing duration imports as 0");
+        assert_eq!(stored[2].2, 0);
 
         // The secret must never reach the database.
         assert!(
@@ -1302,14 +1322,17 @@ mod tests {
             crate::models::ImportEntry {
                 cmd: format!("export AWS_ACCESS_KEY_ID={secret}"),
                 executed_at: None,
+                duration_ms: None,
             },
             crate::models::ImportEntry {
                 cmd: "npm install \\\nlodash".to_string(),
                 executed_at: None,
+                duration_ms: None,
             },
             crate::models::ImportEntry {
                 cmd: "echo no-timestamp".to_string(),
                 executed_at: None,
+                duration_ms: None,
             },
         ];
         let second = store.import_entries(same, "/home/user").unwrap();

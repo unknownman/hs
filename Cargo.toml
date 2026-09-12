@@ -4,6 +4,9 @@ version = "1.0.0"
 edition = "2024"
 description = "A fast, private, project-aware shell history tool"
 license = "MIT"
+readme = "README.md"
+categories = ["command-line-utilities", "development-tools"]
+keywords = ["cli", "history", "shell", "sqlite"]
 repository = "https://github.com/unknownman/hs"
 
 [dependencies]

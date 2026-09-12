@@ -36,6 +36,10 @@ pub struct ImportEntry {
     /// Timestamp from zsh extended history, `None` if unknown
     /// (bash history, or entries without a header).
     pub executed_at: Option<DateTime<Utc>>,
+    /// Wall-clock duration in milliseconds from zsh extended history,
+    /// `None` when the source format did not record how long the
+    /// command ran.
+    pub duration_ms: Option<i64>,
 }
 
 /// Outcome of a bulk history import.
